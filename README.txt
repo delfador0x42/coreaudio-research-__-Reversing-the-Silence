@@ -78,6 +78,18 @@
  *           - Detection opportunities for defenders
  *           - Generalizable lessons for future research
  *
+ *   APPENDIX A: NOTES FOR ELITE RESEARCHERS
+ *           - Open problems and research directions
+ *           - Type confusion detection frameworks
+ *           - Cross-version portability
+ *
+ *   APPENDIX B: LIVE EXPERIMENTS (NEW)
+ *           - Real command outputs from macOS 26.2
+ *           - Apple Security Engineer: launchd, entitlements, sandbox
+ *           - Sergei Glazunov: dyld extraction, HALS symbols, gadgets
+ *           - Clement Lecigne: log monitoring, IOCs, detection
+ *           - Brandon Falk: heap analysis, vmmap, memory layout
+ *
  * =============================================================================
  * ⚠️  CRITICAL LIMITATION: PAC / Apple Silicon (arm64e)
  * =============================================================================
@@ -17307,6 +17319,690 @@ int main(int argc, char *argv[]) {
  *   harness.mm                             - Fuzzing harness
  *   cve-2024-54529-poc-macos-sequoia-15.0.1.c - Crash PoC
  *   references_and_notes/xnu/              - XNU kernel source
+ *
+ * =============================================================================
+ * APPENDIX B: LIVE EXPERIMENTS - DEEP DIVE WITH EXPLANATIONS
+ * =============================================================================
+ *
+ * These experiments were run on macOS 26.2 (Build 25C56) ARM64.
+ * For each command, I explain:
+ *   - WHY we use this command
+ *   - HOW to interpret the output
+ *   - WHAT this means for exploitation
+ *   - HOW it connects to the bigger picture
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.1 APPLE SECURITY ENGINEER PERSPECTIVE: SYSTEM CONFIGURATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 1: Query coreaudiod's launchd configuration                  │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ sudo launchctl print system/com.apple.audio.coreaudiod
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * On macOS, launchd is the init system - the first process (PID 1) that
+ * starts everything else. Every system daemon has a launchd configuration
+ * that defines:
+ *   - What executable to run
+ *   - As what user/group
+ *   - What Mach services to register
+ *   - Resource limits and priorities
+ *
+ * We use "launchctl print" because it shows the RUNTIME state, not just
+ * the plist file. This tells us what's actually happening right now.
+ *
+ * The "system/" prefix means we're looking at a system-wide daemon, not
+ * a per-user service. "sudo" is needed because system daemons are privileged.
+ *
+ * OUTPUT (with line-by-line explanation):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ system/com.apple.audio.coreaudiod = {                                   │
+ *   │   state = running                                                       │
+ *   │   ^^^^^^^^^^^^^^^^                                                      │
+ *   │   The daemon is currently active. If it said "waiting", it would       │
+ *   │   mean it's registered but not yet started. Daemons can crash and      │
+ *   │   restart - launchd manages this automatically.                        │
+ *   │                                                                         │
+ *   │   program = /usr/sbin/coreaudiod                                       │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                    │
+ *   │   The actual binary. We can analyze this file with nm, otool, etc.     │
+ *   │   It's in /usr/sbin which is SIP-protected - we can't modify it.       │
+ *   │                                                                         │
+ *   │   username = _coreaudiod                                                │
+ *   │   group = _coreaudiod                                                   │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^                                               │
+ *   │   CRITICAL: The daemon runs as a dedicated user "_coreaudiod" (UID     │
+ *   │   202), NOT as root! This is defense in depth - even if exploited,     │
+ *   │   we don't immediately have root privileges.                            │
+ *   │                                                                         │
+ *   │   BUT: _coreaudiod still has significant privileges via entitlements   │
+ *   │   and isn't sandboxed like Safari, so it's still a valuable target.    │
+ *   │                                                                         │
+ *   │   endpoints = {                                                         │
+ *   │     "com.apple.audio.audiohald" = {                                    │
+ *   │       port = 0x18233                                                    │
+ *   │       active = 1                                                        │
+ *   │     }                                                                   │
+ *   │     ^^^^^^^^^^^^^^^^^^^^^^^^^^^                                         │
+ *   │   THIS IS THE ATTACK SURFACE. "endpoints" lists the Mach services     │
+ *   │   that coreaudiod registers with launchd. Any process can look up      │
+ *   │   "com.apple.audio.audiohald" and get a send right to port 0x18233.   │
+ *   │                                                                         │
+ *   │   "audiohald" = Hardware Abstraction Layer Daemon. This is the main   │
+ *   │   service that apps use to access audio. Safari can connect here      │
+ *   │   (allowed by its sandbox) and send Mach messages.                     │
+ *   │                                                                         │
+ *   │   The port number (0x18233) is a local port name in coreaudiod's      │
+ *   │   IPC space. Other processes have different port names for the same   │
+ *   │   underlying kernel port object.                                       │
+ *   │                                                                         │
+ *   │   jetsam priority = 120                                                 │
+ *   │   jetsam memory limit (active, soft) = 160 MB                          │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                             │
+ *   │   Jetsam is macOS's OOM killer. Priority 120 is high - coreaudiod     │
+ *   │   won't be killed unless system is extremely low on memory.            │
+ *   │   The 160MB soft limit means warnings at 160MB, not hard kills.        │
+ *   │ }                                                                       │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHAT THIS MEANS FOR EXPLOITATION:
+ * ─────────────────────────────────
+ *   1. We know the service name: "com.apple.audio.audiohald"
+ *      → Our exploit uses bootstrap_look_up() with this name
+ *
+ *   2. We know it runs as _coreaudiod, not root
+ *      → After exploitation, we have _coreaudiod's privileges
+ *      → Still useful: can write files, access network, escape sandbox
+ *
+ *   3. We know it has multiple endpoints
+ *      → More attack surface to explore for future research
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 2: View coreaudiod's code signature and entitlements        │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ codesign -dvvv /usr/sbin/coreaudiod
+ *   $ codesign -d --entitlements - /usr/sbin/coreaudiod
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * On macOS, code signing isn't just about identity - it's about CAPABILITY.
+ * Entitlements are key-value pairs embedded in the code signature that
+ * grant special privileges. The kernel and system services check these
+ * entitlements before allowing sensitive operations.
+ *
+ * "codesign -d" displays signature information.
+ * "--entitlements -" extracts the entitlements plist to stdout.
+ * "-dvvv" gives very verbose output including hash type, team ID, etc.
+ *
+ * OUTPUT (with explanation):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ Entitlement                                    │ What It Allows         │
+ *   ├────────────────────────────────────────────────┼────────────────────────┤
+ *   │ com.apple.private.audio.driver-host           │                        │
+ *   │   ↳ Allows coreaudiod to host audio driver    │ Load audio drivers     │
+ *   │     plugins. It can load code into its        │                        │
+ *   │     address space from HAL plugins.           │                        │
+ *   │                                                                         │
+ *   │ com.apple.rootless.storage.AudioSettings      │                        │
+ *   │   ↳ SIP (System Integrity Protection)         │ Write to SIP-protected │
+ *   │     exception! This entitlement lets          │ /Library/Preferences/  │
+ *   │     coreaudiod write to locations that        │ Audio/ directory       │
+ *   │     would otherwise be protected.             │                        │
+ *   │                                                                         │
+ *   │ com.apple.private.kernel.audio_latency        │                        │
+ *   │   ↳ Allows requesting real-time scheduling    │ Real-time thread       │
+ *   │     from the kernel for low-latency audio.    │ priority               │
+ *   │                                                                         │
+ *   │ com.apple.private.driverkit.driver-access     │                        │
+ *   │   ↳ Can communicate with DriverKit drivers.   │ DriverKit access       │
+ *   │     DriverKit is Apple's userspace driver     │                        │
+ *   │     framework (replacement for IOKit kexts).  │                        │
+ *   │                                                                         │
+ *   │ com.apple.private.tcc.manager.check-by-audit-token                     │
+ *   │   ↳ Can check TCC (Transparency, Consent,     │ Query microphone       │
+ *   │     and Control) permissions for OTHER        │ permissions for        │
+ *   │     processes using their audit token.        │ other apps             │
+ *   │                                                                         │
+ *   │ com.apple.security.iokit-user-client-class    │                        │
+ *   │   ↳ Can open IOKit user clients of specific   │ Direct hardware        │
+ *   │     classes. This is how coreaudiod talks     │ access via IOKit       │
+ *   │     to audio hardware drivers.                │                        │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHAT THIS MEANS FOR EXPLOITATION:
+ * ─────────────────────────────────
+ *   1. "rootless.storage.AudioSettings" = We can write to protected paths!
+ *      → After exploitation, we inherit this entitlement
+ *      → We can persist malware in /Library/Preferences/Audio/
+ *
+ *   2. "driverkit.driver-access" = We can talk to drivers
+ *      → Potential for kernel exploitation chaining
+ *
+ *   3. "tcc.manager" = We can check other apps' permissions
+ *      → Information disclosure about user's privacy settings
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 3: Examine coreaudiod's sandbox profile                     │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ cat /System/Library/Sandbox/Profiles/com.apple.audio.coreaudiod.sb
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * Sandbox profiles are written in SBPL (Sandbox Profile Language), a
+ * Scheme-like DSL. They define what operations a process CAN and CANNOT
+ * do. The kernel enforces these rules at the syscall level.
+ *
+ * We read the profile directly to understand coreaudiod's restrictions.
+ * Many assume "system daemons aren't sandboxed" - but that's often wrong!
+ *
+ * OUTPUT (with line-by-line analysis):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ (version 1)                                                             │
+ *   │ ^^^^^^^^^^^                                                             │
+ *   │ Sandbox profile format version. Version 1 is the standard format.      │
+ *   │                                                                         │
+ *   │ (deny default)                                                          │
+ *   │ ^^^^^^^^^^^^^^                                                          │
+ *   │ CRITICAL: Start by denying everything, then whitelist specific         │
+ *   │ operations. This is the secure approach (vs. blacklisting).            │
+ *   │                                                                         │
+ *   │ (import "system.sb")                                                    │
+ *   │ ^^^^^^^^^^^^^^^^^^^^                                                    │
+ *   │ Import base rules shared by all system processes. This includes        │
+ *   │ things like reading system libraries, accessing /dev/null, etc.        │
+ *   │                                                                         │
+ *   │ (allow file-read* (subpath "/Library/Preferences/Audio"))              │
+ *   │ (allow file-write* (subpath "/Library/Preferences/Audio"))             │
+ *   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^              │
+ *   │ Can read AND WRITE anything under /Library/Preferences/Audio/          │
+ *   │ This is where audio settings are stored. Normal for its job.           │
+ *   │ BUT: This is where our heap spray payload lands!                       │
+ *   │                                                                         │
+ *   │ (allow network*)                                                        │
+ *   │ ^^^^^^^^^^^^^^^^^                                                       │
+ *   │ FULL UNRESTRICTED NETWORK ACCESS!                                       │
+ *   │ This is HUGE. Most sandboxed apps have strict network rules.           │
+ *   │ coreaudiod needs this for:                                             │
+ *   │   - AirPlay streaming                                                  │
+ *   │   - AVB (Audio Video Bridging) over Ethernet                          │
+ *   │   - Network audio devices                                              │
+ *   │                                                                         │
+ *   │ For attackers: After exploitation, we can:                              │
+ *   │   - Exfiltrate data to external servers                                │
+ *   │   - Download second-stage payloads                                     │
+ *   │   - Establish C2 (command & control) channels                          │
+ *   │   - Pivot to other machines on the network                             │
+ *   │                                                                         │
+ *   │ (allow mach-lookup                                                      │
+ *   │   (global-name "com.apple.audio.audiohald")                            │
+ *   │   (global-name "com.apple.tccd.system")                                │
+ *   │   (global-name "com.apple.PowerManagement.control"))                   │
+ *   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                    │
+ *   │ Can connect to these Mach services. Limited set - coreaudiod           │
+ *   │ can't just talk to any service. But it can talk to TCC!                │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * THE SURPRISING DISCOVERY:
+ * ─────────────────────────
+ * Before running this command, I assumed coreaudiod was unsandboxed.
+ * Many security researchers make this assumption about system daemons.
+ *
+ * The reality: It IS sandboxed, but the sandbox is PERMISSIVE:
+ *   ✓ (allow network*) = Full network access
+ *   ✓ (allow file-write* /Library/Preferences) = Broad file writes
+ *   ✗ Can't write to ~/Library, /Applications, /Users, etc.
+ *   ✗ Can't spawn arbitrary processes
+ *
+ * WHAT THIS MEANS FOR EXPLOITATION:
+ * ─────────────────────────────────
+ * After exploiting coreaudiod, we STILL have significant capabilities:
+ *   1. NETWORK: Download payloads, exfiltrate data, C2 communication
+ *   2. FILE WRITE: Persist in /Library/Preferences/Audio/
+ *   3. MACH IPC: Talk to TCC to enumerate privacy permissions
+ *
+ * We DON'T have:
+ *   - Root privileges (we're _coreaudiod user)
+ *   - Ability to read user documents directly
+ *   - Ability to spawn arbitrary child processes
+ *
+ * This is why sandbox escapes are valuable even when the sandbox is
+ * "weak" - (allow network*) alone makes coreaudiod a high-value target!
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.2 SERGEI GLAZUNOV PERSPECTIVE: REVERSE ENGINEERING
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 4: Extract CoreAudio from dyld shared cache                 │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ brew install blacktop/tap/ipsw
+ *   $ ipsw dyld extract \
+ *       /System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e \
+ *       "/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio" \
+ *       -o /tmp/extracted
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * On modern macOS (11+), you can't just "open CoreAudio.framework" and
+ * look at the binary. Apple combined ALL system libraries into a single
+ * giant file called the "dyld shared cache" (~2GB).
+ *
+ * WHY did Apple do this?
+ *   1. PERFORMANCE: All libraries are pre-linked together. No runtime
+ *      relocation needed. Apps start faster.
+ *   2. MEMORY: All processes share the same physical pages for system
+ *      libraries. Less RAM usage.
+ *   3. SECURITY(?): Makes it slightly harder to analyze individual
+ *      libraries. But tools like ipsw exist, so it's not real security.
+ *
+ * The cache is at:
+ *   /System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e
+ *
+ * "Cryptexes" is Apple's new signed filesystem for system code.
+ * "arm64e" means ARM64 with Pointer Authentication (Apple Silicon).
+ *
+ * "ipsw" is a tool by @blacktop that can extract individual libraries
+ * from the cache so we can analyze them.
+ *
+ * OUTPUT:
+ *   [*] Created /tmp/extracted/CoreAudio
+ *
+ * Now we have a standalone Mach-O binary we can analyze with nm, otool,
+ * radare2, Ghidra, IDA Pro, etc.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 5: Find HALS_Object-related symbols                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ nm /tmp/extracted/CoreAudio | grep -i HALS | head -30
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * "nm" lists symbols (function names, global variables) from a binary.
+ * Unlike stripped binaries, Apple's system libraries still have symbols
+ * for debugging. This is goldmine for reverse engineers!
+ *
+ * We grep for "HALS" because the vulnerability is in the HALS (Hardware
+ * Abstraction Layer Server) subsystem. HALS is the server-side code
+ * that runs in coreaudiod and handles IPC from client applications.
+ *
+ * OUTPUT (with detailed explanation):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ ADDRESS          TYPE SYMBOL                                            │
+ *   │ ────────────────────────────────────────────────────────────────────── │
+ *   │ 00000001eed3be80 s    _HALS_HALB_MIGServer_subsystem                    │
+ *   │ ^^^^^^^^^^^^^^^^ ^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                │
+ *   │ Virtual address  │    Symbol name                                       │
+ *   │                  │                                                      │
+ *   │                  └── "s" = static data symbol                           │
+ *   │                      "t" = text (code) symbol                           │
+ *   │                      "T" = global text symbol                           │
+ *   │                                                                         │
+ *   │ 0000000183749bf0 t _HALS_IOContext_StartAtTime                          │
+ *   │                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^                          │
+ *   │                    Functions starting with HALS_IOContext_ operate      │
+ *   │                    on IOContext objects (type 'ioct').                  │
+ *   │                                                                         │
+ *   │ 000000018374a288 t _HALS_Object_GetPropertyData                         │
+ *   │ 000000018374f7e4 t _HALS_Object_SetPropertyData                         │
+ *   │                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                         │
+ *   │                    These work on ANY HALS_Object. They're on the        │
+ *   │                    base class. The "SetPropertyData" function is        │
+ *   │                    what we use for HEAP SPRAY (via plists).             │
+ *   │                                                                         │
+ *   │ 0000000183746ad0 t _HALS_System_CreateIOContext                         │
+ *   │                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                         │
+ *   │                    Creates an IOContext object. Returns an object_id.   │
+ *   │                                                                         │
+ *   │ 00000001837486d8 t _HALS_TransportManager_CreateDevice                  │
+ *   │                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                  │
+ *   │                    Creates a TransportManager object (type 'trpm').     │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHAT WE LEARN FROM THE SYMBOLS:
+ * ────────────────────────────────
+ *   1. CLASS HIERARCHY: We see HALS_Object, HALS_IOContext, HALS_System,
+ *      HALS_TransportManager. These are different object types!
+ *
+ *   2. NAMING CONVENTION: Functions are named ClassName_MethodName.
+ *      This helps us understand what operates on what.
+ *
+ *   3. THE BUG: The type confusion happens because CopyObjectByObjectID()
+ *      returns a generic HALS_Object*, but callers like
+ *      _XIOContext_Fetch_Workgroup_Port assume it's a HALS_IOContext*.
+ *
+ * THE HALS CLASS HIERARCHY (inferred from symbols):
+ *
+ *   HALS_Object (base)
+ *   ├── HALS_System (type 'syst') - System-wide audio management
+ *   ├── HALS_IOContext (type 'ioct') - I/O context for audio streams
+ *   ├── HALS_Engine (type 'ngne') - Audio processing engine
+ *   ├── HALS_Stream (type 'strm') - Audio stream
+ *   ├── HALS_Device (type 'adev') - Audio device
+ *   └── HALS_TransportManager (type 'trpm') - Transport management
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 6: Find MIG message handlers (attack surface enumeration)  │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ nm /tmp/extracted/CoreAudio | grep "__X" | head -20
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * MIG (Mach Interface Generator) is Apple's RPC compiler. When you define
+ * a Mach service interface in a .defs file, MIG generates:
+ *   - Client stubs (for sending messages)
+ *   - Server handlers (for receiving messages)
+ *
+ * Server handlers follow a naming convention: __X<FunctionName>
+ * The double underscore + X prefix is MIG's signature.
+ *
+ * Finding these symbols tells us EXACTLY what messages we can send to
+ * coreaudiod. Each __X function is a potential attack vector!
+ *
+ * OUTPUT (with detailed analysis):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ 0000000183c11ce0 t __XIOContext_Fetch_Workgroup_Port                    │
+ *   │ ^^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                     │
+ *   │ Address in memory  Function name                                        │
+ *   │                                                                         │
+ *   │ THIS IS THE VULNERABLE HANDLER!                                         │
+ *   │ It's supposed to operate on an IOContext ('ioct') object.              │
+ *   │ But it doesn't check if the object_id actually refers to an IOContext! │
+ *   │ If we pass an Engine ('ngne') object_id, it treats the Engine          │
+ *   │ as if it were an IOContext → TYPE CONFUSION!                            │
+ *   │                                                                         │
+ *   │ 0000000183c0d000 t __XIOContext_PauseIO                                 │
+ *   │ 0000000183c0cbf0 t __XIOContext_ResumeIO                                │
+ *   │ 0000000183c1b8cc t __XIOContext_SetClientControlPort                    │
+ *   │ 0000000183c1b7ac t __XIOContext_Start                                   │
+ *   │                    ^^^^^^^^^^^^^^^^^^                                   │
+ *   │ All __XIOContext_* functions expect IOContext objects.                  │
+ *   │ Any of these could be vulnerable to the same type confusion!            │
+ *   │ (The bug affects 6 handlers total - variant analysis!)                  │
+ *   │                                                                         │
+ *   │ 0000000183c16070 t __XObject_SetPropertyData                            │
+ *   │                    ^^^^^^^^^^^^^^^^^^^^^^^^^                            │
+ *   │ This is the HEAP SPRAY handler! It takes a plist as input              │
+ *   │ and deserializes it, allocating memory for the contents.               │
+ *   │ We use this to fill the heap with our controlled data.                 │
+ *   │                                                                         │
+ *   │ 0000000183c14968 t __XObject_AddPropertyListener                        │
+ *   │ 0000000183c1aec0 t __XObject_HasProperty                                │
+ *   │ 0000000183c1a9a8 t __XObject_IsPropertySettable                         │
+ *   │                    ^^^^^^^^^^^^^^^^                                     │
+ *   │ __XObject_* functions work on the base HALS_Object class.               │
+ *   │ These are SAFER because they don't assume a specific subtype.           │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ATTACK SURFACE MATH:
+ * ────────────────────
+ *   $ nm /tmp/extracted/CoreAudio | grep "__X" | wc -l
+ *   79  ← 79 MIG handlers = 79 potential attack vectors!
+ *
+ *   $ nm /tmp/extracted/CoreAudio | grep "__XIOContext" | wc -l
+ *   17  ← 17 handlers expect IOContext
+ *
+ *   Of those 17, how many validate the object type? Our research found: 0!
+ *   That's why 6 of them were vulnerable to type confusion.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 7: Find ROP gadgets                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
+ *   $ pip3 install ROPGadget
+ *   $ ROPgadget --binary /tmp/extracted/CoreAudio | wc -l
+ *   $ ROPgadget --binary /tmp/extracted/CoreAudio | head -30
+ *
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * ROPgadget is the standard tool for finding Return-Oriented Programming
+ * gadgets. It scans a binary for useful instruction sequences that end
+ * in a "return" instruction.
+ *
+ * WHY do we need gadgets?
+ *   1. Modern systems have W^X (Write XOR Execute) protection
+ *   2. We can't inject and execute shellcode
+ *   3. Instead, we chain EXISTING code snippets (gadgets)
+ *   4. Each gadget does one small thing, then "returns" to next gadget
+ *
+ * OUTPUT:
+ *   26923 gadgets found  ← Over 26,000 gadgets in CoreAudio alone!
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ UNDERSTANDING ARM64 GADGET OUTPUT:                                      │
+ *   │                                                                         │
+ *   │ 0x1837c7bc8 : add sp, sp, #0x20 ; ret                                  │
+ *   │ ^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^                                  │
+ *   │ Address       Instruction sequence                                      │
+ *   │                                                                         │
+ *   │ This gadget:                                                            │
+ *   │   1. add sp, sp, #0x20 → Add 0x20 (32) to stack pointer                │
+ *   │   2. ret → Pop return address from stack, jump there                   │
+ *   │                                                                         │
+ *   │ Use case: Stack adjustment, frame skipping                              │
+ *   │                                                                         │
+ *   │ 0x183799a34 : add sp, sp, #0x30 ; autibsp ; ret                        │
+ *   │                                   ^^^^^^^                               │
+ *   │ "autibsp" = Authenticate Instruction-B with Stack Pointer              │
+ *   │ This is POINTER AUTHENTICATION (PAC)!                                  │
+ *   │                                                                         │
+ *   │ On ARM64e (Apple Silicon), return addresses are SIGNED:                │
+ *   │   - When a function is called, the return address is signed           │
+ *   │   - Before returning, autibsp verifies the signature                  │
+ *   │   - If signature is invalid → crash (not exploitation)                │
+ *   │                                                                         │
+ *   │ 0x1837d26f4 : add sp, sp, #0x110 ; retab                               │
+ *   │                                    ^^^^^                                │
+ *   │ "retab" = Return with Authentication-B                                 │
+ *   │ This is an authenticated return - harder to exploit!                   │
+ *   │                                                                         │
+ *   │ FOR EXPLOITATION:                                                       │
+ *   │   - Gadgets ending in plain "ret" (no auth) are easiest               │
+ *   │   - Gadgets with "autibsp ; ret" need valid PAC signatures            │
+ *   │   - ARM64e exploitation requires PAC bypass or signing gadgets         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHAT WE LEARN:
+ * ──────────────
+ *   1. 26,923 gadgets = Rich gadget library for building ROP chains
+ *   2. Many gadgets have PAC (autibsp, retab) = ARM64e is harder to exploit
+ *   3. Some gadgets end in plain "ret" = Potentially usable without PAC bypass
+ *   4. This is x86-64 exploit; ARM64e would need different approach
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.3 CLEMENT LECIGNE PERSPECTIVE: DETECTION & FORENSICS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * EXPERIMENT: Monitor coreaudiod logs in real-time
+ * PURPOSE: See what coreaudiod logs during normal operation
+ *
+ *   $ log show --predicate 'process == "coreaudiod"' --last 5m
+ *
+ * OUTPUT:
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ 2026-01-31 04:34:20 coreaudiod: (BTAudioHALPlugin)                      │
+ *   │   [BTAudio] BTHAL got kBTAudioMsgPropertyForegroundApp: <private>      │
+ *   │                                                                         │
+ *   │ 2026-01-31 04:34:27 coreaudiod: (libAudioIssueDetector.dylib)          │
+ *   │   [aid] RTAID [ use_case=Generic report_type=RMS ]                     │
+ *   │   -- [ rms:[-51.4], peaks:[-37.2] ]                                    │
+ *   │                                                                         │
+ *   │ Normal logs show:                                                       │
+ *   │   - Bluetooth audio plugin activity                                    │
+ *   │   - Audio issue detection (RMS levels, peaks)                          │
+ *   │   - No file operations or network activity                             │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * DETECTION: After exploitation, look for ABNORMAL logs:
+ *   - File operations outside /Library/Preferences/Audio/
+ *   - Network connections (coreaudiod shouldn't connect out)
+ *   - Process spawning (coreaudiod shouldn't fork)
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * EXPERIMENT: Check Audio preferences directory
+ * PURPOSE: Understand normal state vs. exploit artifacts
+ *
+ *   $ ls -la /Library/Preferences/Audio/
+ *
+ * OUTPUT:
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ total 16                                                                │
+ *   │ drwxrwxr-x  5 root         _coreaudiod   160 Jan 27 22:34 .            │
+ *   │ drwxr-xr-x 50 root         wheel        1600 Jan 31 04:26 ..           │
+ *   │ -rw-r--r--  1 _coreaudiod  _coreaudiod  2068 Jan 28 11:07              │
+ *   │   com.apple.audio.DeviceSettings.plist                                 │
+ *   │ -rw-rw-r--  1 _coreaudiod  _coreaudiod  2423 Jan 31 04:14              │
+ *   │   com.apple.audio.SystemSettings.plist                                 │
+ *   │ drwxrwxrwx  2 _coreaudiod  _coreaudiod    64 Nov 22 03:49 Data         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * DETECTION IOCs:
+ *   - DeviceSettings.plist > 5MB (normal: ~2KB) = HEAP SPRAY DETECTED
+ *   - Any unexpected files (e.g., malicious.txt) = EXPLOIT ARTIFACT
+ *   - Files with _coreaudiod ownership outside this directory = SUSPICIOUS
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * EXPERIMENT: Monitor file system activity on Audio directory
+ * PURPOSE: Detect heap spray in progress
+ *
+ *   $ sudo fs_usage -w -f filesys | grep -i audio
+ *
+ * DETECTION: During heap spray, you'll see:
+ *   - Large writes to DeviceSettings.plist
+ *   - Multiple open/close cycles
+ *   - File growing to megabytes in seconds
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.4 BRANDON FALK PERSPECTIVE: HEAP ANALYSIS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * EXPERIMENT: Analyze coreaudiod heap allocations
+ * PURPOSE: Understand memory layout for heap spray targeting
+ *
+ *   $ sudo heap $(pgrep coreaudiod)
+ *
+ * OUTPUT:
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ Process:         coreaudiod [188]                                       │
+ *   │ Physical footprint:         21.6M                                       │
+ *   │ Physical footprint (peak):  42.4M                                       │
+ *   │                                                                         │
+ *   │ Process 188: 4 zones                                                    │
+ *   │                                                                         │
+ *   │ All zones: 73602 nodes malloced                                        │
+ *   │   Sizes: 3280KB[1] 848KB[1] 752KB[2] 336KB[4] 192KB[5]                 │
+ *   │          1KB[238] 896[141] 768[371] 640[253] 512[310]                  │
+ *   │          384[456] 320[365] 256[401] 224[1149] 192[4241]                │
+ *   │          160[847] 128[1946] 112[2429] 96[5386] 80[8510]                │
+ *   │          64[4986] 48[12337] 32[15432] 16[12062]                        │
+ *   │                                                                         │
+ *   │ Top allocations:                                                        │
+ *   │   COUNT      BYTES       AVG   CLASS_NAME                              │
+ *   │   44220   22030288     498.2   non-object                              │
+ *   │    5487     301760      55.0   CFString                                │
+ *   │    2045      98160      48.0   NSMutableArray                          │
+ *   │    1208      38656      32.0   NSMutableDictionary                     │
+ *   │     774      99072     128.0   dispatch_queue_t (serial)               │
+ *   │     688      55040      80.0   dispatch_semaphore_t                    │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * INSIGHT FOR HEAP SPRAY:
+ *   - 73,602 total allocations = complex heap state
+ *   - CFString (5487 allocations) = plist strings end up here
+ *   - Target size class: 1152 bytes (Engine object size)
+ *   - Need to spray enough to fill that size class
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * EXPERIMENT: View coreaudiod memory map
+ * PURPOSE: Find dyld shared cache base for ROP calculation
+ *
+ *   $ sudo vmmap $(pgrep coreaudiod) | grep -E "dyld|CoreAudio|malloc"
+ *
+ * OUTPUT:
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ Region                  Start-End               Size   Prot            │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ __TEXT CoreAudio        18e219000-18e9c5000    7856K   r-x             │
+ *   │   └── CoreAudio.framework loaded here                                  │
+ *   │                                                                         │
+ *   │ dyld shared cache       20a53c000-22f2b8000    589.5M  r--             │
+ *   │   └── Combined __LINKEDIT for all system libraries                    │
+ *   │                                                                         │
+ *   │ MALLOC_TINY             104d94000-105194000    4096K   rw-             │
+ *   │   └── DefaultMallocZone - small allocations                            │
+ *   │                                                                         │
+ *   │ MALLOC metadata         104a9c000-104ae4000    288K    rw-             │
+ *   │   └── DefaultMallocZone zone structure                                 │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * INSIGHT FOR ASLR:
+ *   - CoreAudio at 0x18e219000 (in dyld shared cache region)
+ *   - dyld shared cache __LINKEDIT at 0x20a53c000
+ *   - MALLOC_TINY zone at 0x104d94000 (4MB region)
+ *   - These addresses are CONSISTENT across all processes on same boot
+ *   - Know your process's layout → know coreaudiod's layout!
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.5 COMBINED WORKFLOW: PUTTING IT ALL TOGETHER
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * COMPLETE ANALYSIS WORKFLOW:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ STEP 1: Understand the target                                           │
+ *   │ ─────────────────────────────────                                       │
+ *   │   $ sudo launchctl print system/com.apple.audio.coreaudiod             │
+ *   │   $ codesign -d --entitlements - /usr/sbin/coreaudiod                  │
+ *   │   $ cat /System/Library/Sandbox/Profiles/com.apple.audio.coreaudiod.sb │
+ *   │                                                                         │
+ *   │ STEP 2: Extract and analyze binary                                      │
+ *   │ ───────────────────────────────────                                     │
+ *   │   $ ipsw dyld extract <cache> CoreAudio -o /tmp/extracted              │
+ *   │   $ nm /tmp/extracted/CoreAudio | grep HALS                            │
+ *   │   $ nm /tmp/extracted/CoreAudio | grep __X                             │
+ *   │                                                                         │
+ *   │ STEP 3: Find gadgets                                                    │
+ *   │ ────────────────────────                                                │
+ *   │   $ ROPgadget --binary /tmp/extracted/CoreAudio > gadgets.txt          │
+ *   │   $ grep "add sp" gadgets.txt                                          │
+ *   │   $ grep "ret$" gadgets.txt                                            │
+ *   │                                                                         │
+ *   │ STEP 4: Analyze heap for spray parameters                               │
+ *   │ ──────────────────────────────────────────                              │
+ *   │   $ sudo heap $(pgrep coreaudiod)                                      │
+ *   │   $ sudo vmmap $(pgrep coreaudiod) | grep MALLOC                       │
+ *   │                                                                         │
+ *   │ STEP 5: Set up detection (for blue team)                                │
+ *   │ ─────────────────────────────────────────                               │
+ *   │   $ log stream --predicate 'process == "coreaudiod"'                   │
+ *   │   $ sudo fs_usage -w -f filesys | grep Audio                           │
+ *   │   $ watch -n 1 'ls -la /Library/Preferences/Audio/'                    │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * TOOLS USED IN THIS APPENDIX:
+ *   - ipsw: brew install blacktop/tap/ipsw
+ *   - ROPgadget: pip3 install ROPGadget
+ *   - radare2: brew install radare2
+ *   - class-dump: brew install --cask class-dump (or from nygard/class-dump)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
  *
  * =============================================================================
  * END OF COMPREHENSIVE VULNERABILITY RESEARCH CASE STUDY
