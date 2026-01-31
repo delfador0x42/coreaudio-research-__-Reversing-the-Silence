@@ -6935,6 +6935,45 @@ int main(int argc, char *argv[]) {
  *     2. Find the dispatch table that references this ID
  *     3. Follow to the handler function
  *
+ *   ═══════════════════════════════════════════════════════════════════════
+ *   THE LIBRARY CARD MENTAL MODEL (Why Type Confusion Happens)
+ *   ═══════════════════════════════════════════════════════════════════════
+ *
+ *   Object IDs are like library card numbers - they find a book, but
+ *   the librarian doesn't verify it's the right GENRE.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │              THE LIBRARY (HALS_ObjectMap)                           │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   REQUEST: "Give me book #11807"                                   │
+ *   │                                                                     │
+ *   │   LIBRARIAN (CopyObjectByObjectID):                                │
+ *   │   ┌─────────────────────────────────────────────────────────────┐  │
+ *   │   │ "Here's book #11807!"                                       │  │
+ *   │   │                                                             │  │
+ *   │   │  ┌─────────────┐      ┌─────────────┐                      │  │
+ *   │   │  │ EXPECTED:   │      │ ACTUAL:     │                      │  │
+ *   │   │  │ Romance     │  vs  │ Horror      │                      │  │
+ *   │   │  │ Novel       │      │ Novel       │                      │  │
+ *   │   │  │ (IOContext) │      │ (Engine)    │                      │  │
+ *   │   │  └─────────────┘      └─────────────┘                      │  │
+ *   │   │                                                             │  │
+ *   │   │  "I don't check genres. That's YOUR problem."              │  │
+ *   │   └─────────────────────────────────────────────────────────────┘  │
+ *   │                                                                     │
+ *   │   READER (Handler): Opens book expecting romance chapter layout... │
+ *   │   ... finds horror content at expected page number (offset 0x70)   │
+ *   │   ... CRASHES (or worse, executes the horror plot!)                │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ THE BUG: CopyObjectByObjectID() returns ANY object type.     ║ │
+ *   │   ║ Handlers ASSUME the type based on message ID, not reality.   ║ │
+ *   │   ║ Pass an Engine ID to an IOContext handler → type confusion!  ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
  *   STEP 5: Trace object creation and lookup
  *   ─────────────────────────────────────────
  *   Attach lldb and set breakpoints:
@@ -6955,6 +6994,53 @@ int main(int argc, char *argv[]) {
  *     Offset 0x08: reference count
  *     Offset 0x10: object ID
  *     Offset 0x18: type (4-byte FourCC, e.g., 'ioct')
+ *
+ *   ═══════════════════════════════════════════════════════════════════════
+ *   THE WRONG BLUEPRINT (Why Type Confusion Causes Crashes)
+ *   ═══════════════════════════════════════════════════════════════════════
+ *
+ *   Different object types share the SAME first few fields, then DIVERGE.
+ *   Like two buildings with the same lobby but completely different floors:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │     BUILDING BLUEPRINTS: Same Address, Different Plans             │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   IOContext (Expected)         Engine (Actual)                     │
+ *   │   ════════════════════         ══════════════                      │
+ *   │                                                                     │
+ *   │   0x00 ┌──────────────┐        ┌──────────────┐                    │
+ *   │        │   vtable     │        │   vtable     │  ✓ SAME            │
+ *   │   0x08 ├──────────────┤        ├──────────────┤                    │
+ *   │        │   refcount   │        │   refcount   │  ✓ SAME            │
+ *   │   0x10 ├──────────────┤        ├──────────────┤                    │
+ *   │        │  object_id   │        │  object_id   │  ✓ SAME            │
+ *   │   0x18 ├──────────────┤        ├──────────────┤                    │
+ *   │        │ type="ioct"  │        │ type="ngne"  │  ✗ DIFFERS!        │
+ *   │        ├──────────────┤        ├──────────────┤                    │
+ *   │        │     ...      │        │     ...      │  (different        │
+ *   │        │  (IOContext  │        │  (Engine     │   internal         │
+ *   │        │   fields)    │        │   fields)    │   layouts)         │
+ *   │   0x68 ├──────────────┤        ├──────────────┤                    │
+ *   │        │              │        │ ████████████ │  ◄── 6-byte gap    │
+ *   │   0x70 ├──────────────┤        ├──────────────┤                    │
+ *   │        │  workgroup   │───┐    │ UNINITIALIZED│  ◄── BOOM!         │
+ *   │        │   pointer    │   │    │   GARBAGE    │                    │
+ *   │        └──────────────┘   │    └──────────────┘                    │
+ *   │                           │           │                             │
+ *   │                           │           ▼                             │
+ *   │   Handler does:           │    Dereferences garbage                │
+ *   │   ptr = obj[0x70]   ──────┘    → Attacker controls this!           │
+ *   │   func = ptr[0x168]            → ROP chain at 0x168                │
+ *   │   func(obj)                    → Code execution!                   │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ The handler expects offset 0x70 to be a valid workgroup ptr. ║ │
+ *   │   ║ In an Engine object, that offset contains GARBAGE.            ║ │
+ *   │   ║ If we groom the heap, that "garbage" is our ROP payload!      ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -8394,6 +8480,46 @@ int main(int argc, char *argv[]) {
  * Reference: XNU Source Code, dmcyk.xyz "XNU IPC: Mach Messages"
  *   https://dmcyk.xyz/post/xnu_ipc_i_mach_messages/
  *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE MAILROOM MENTAL MODEL (For Beginners)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Before diving into kernel structures, let's build intuition with a metaphor:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    THE MAILROOM (XNU Kernel)                        │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   SENDER (Safari)              RECEIVER (coreaudiod)                │
+ *   │   ┌──────────┐                 ┌──────────┐                         │
+ *   │   │ Mailbox  │                 │ Mailbox  │                         │
+ *   │   │ (port)   │                 │ (port)   │                         │
+ *   │   └────┬─────┘                 └────▲─────┘                         │
+ *   │        │                            │                               │
+ *   │        │ "I have a letter"          │ "Letter for you"              │
+ *   │        ▼                            │                               │
+ *   │   ┌─────────────────────────────────┴───┐                           │
+ *   │   │         MAILROOM CLERK              │                           │
+ *   │   │         (ipc_kmsg)                  │                           │
+ *   │   │                                     │                           │
+ *   │   │  1. Check sender's ID (audit_token) │                           │
+ *   │   │  2. Copy letter contents            │                           │
+ *   │   │  3. Walk to receiver's mailbox      │                           │
+ *   │   │  4. Deliver letter                  │                           │
+ *   │   └─────────────────────────────────────┘                           │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ KEY INSIGHT: The clerk doesn't READ the letter contents -    ║ │
+ *   │   ║ it just delivers. Content validation is the RECEIVER's job!  ║ │
+ *   │   ║                                                              ║ │
+ *   │   ║ This is why type confusion bugs exist: coreaudiod trusts     ║ │
+ *   │   ║ that the object ID in the message is the right TYPE.         ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * Now let's see how this maps to actual kernel structures...
+ *
  * -----------------------------------------------------------------------------
  * 9.1 MACH: THE MICROKERNEL FOUNDATION
  * -----------------------------------------------------------------------------
@@ -8924,6 +9050,119 @@ int main(int argc, char *argv[]) {
  *
  * Understanding heap internals is crucial for reliable exploitation.
  *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE HEIST: 5-PHASE EXPLOITATION TIMELINE (Big Picture)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Before diving into CFString internals, here's the complete exploit flow:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    THE HEIST: 5 PHASES                              │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │  PHASE 1: PLANT THE PAYLOAD                                        │
+ *   │  ─────────────────────────────                                     │
+ *   │  ┌─────────┐    ┌─────────┐    ┌─────────────────┐                │
+ *   │  │ Build   │───▶│ Spray   │───▶│ Plist saved to │                │
+ *   │  │ ROP     │    │ 24,000  │    │ disk with our  │                │
+ *   │  │ payload │    │ copies  │    │ payload inside │                │
+ *   │  └─────────┘    └─────────┘    └─────────────────┘                │
+ *   │                                                                     │
+ *   │  PHASE 2: TRIGGER THE ALARM (Intentional Crash)                    │
+ *   │  ───────────────────────────────────────────────                   │
+ *   │  ┌─────────────────┐    ┌─────────────────────┐                   │
+ *   │  │ Send bad object │───▶│ coreaudiod crashes  │                   │
+ *   │  │ ID (0x1)        │    │ SIGSEGV → restart   │                   │
+ *   │  └─────────────────┘    └─────────────────────┘                   │
+ *   │                                                                     │
+ *   │  PHASE 3: THE GUARDS CHANGE SHIFT (Restart)                        │
+ *   │  ───────────────────────────────────────────                       │
+ *   │  ┌─────────────────────────────────────────────┐                  │
+ *   │  │ coreaudiod restarts → reads poisoned plist  │                  │
+ *   │  │                                             │                  │
+ *   │  │ malloc_small: [FREE][FREE][FREE][FREE]      │                  │
+ *   │  │               (holes where our data was)    │                  │
+ *   │  └─────────────────────────────────────────────┘                  │
+ *   │                                                                     │
+ *   │  PHASE 4: SLIP INTO POSITION                                       │
+ *   │  ────────────────────────────                                      │
+ *   │  ┌─────────────────────────────────────────────┐                  │
+ *   │  │ Create Engine objects via message 1010042   │                  │
+ *   │  │                                             │                  │
+ *   │  │ malloc_small: [ENGN][ENGN][ENGN][ENGN]     │                  │
+ *   │  │               (engines reuse the holes!)    │                  │
+ *   │  │               (offset 0x70 = our ROP data!) │                  │
+ *   │  └─────────────────────────────────────────────┘                  │
+ *   │                                                                     │
+ *   │  PHASE 5: OPEN THE VAULT                                           │
+ *   │  ────────────────────────                                          │
+ *   │  ┌─────────────────┐    ┌─────────────────────┐                   │
+ *   │  │ Trigger type    │───▶│ Handler reads 0x70  │                   │
+ *   │  │ confusion with  │    │ from Engine object  │                   │
+ *   │  │ Engine ID       │    │ → Finds ROP payload │                   │
+ *   │  │ (msg 1010059)   │    │ → Stack pivot       │                   │
+ *   │  │                 │    │ → ROP executes!     │                   │
+ *   │  └─────────────────┘    └─────────────────────┘                   │
+ *   │                                                                     │
+ *   │  RESULT: File written to /Library/Preferences/Audio/               │
+ *   │          (Proof of sandbox escape - coreaudiod is unsandboxed!)    │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE TROJAN PLIST (How ROP Payload Survives Serialization)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The key challenge: How do we get arbitrary bytes into coreaudiod's heap?
+ * Answer: Smuggle them through plist parsing as "string" data.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │           THE SMUGGLING OPERATION                                   │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │  STEP 1: Raw Contraband (ROP gadgets = executable addresses)       │
+ *   │  ┌──────────────────────────────────────────────┐                  │
+ *   │  │ 0x48 0x8D 0x44 0x24 0x08  (lea rax,[rsp+8])  │                  │
+ *   │  │ 0x48 0x83 0xC4 0x30      (add rsp, 0x30)     │                  │
+ *   │  │ ... (1152 bytes of machine code addresses)   │                  │
+ *   │  └──────────────────────────────────────────────┘                  │
+ *   │                     │                                               │
+ *   │                     ▼ DISGUISE AS TEXT                              │
+ *   │  STEP 2: Encode as UTF-16LE "string"                               │
+ *   │  ┌──────────────────────────────────────────────┐                  │
+ *   │  │ CFStringCreateWithBytes(..., UTF16LE)        │                  │
+ *   │  │ Result: "Valid" string that contains binary! │                  │
+ *   │  └──────────────────────────────────────────────┘                  │
+ *   │                     │                                               │
+ *   │                     ▼ MULTIPLY                                      │
+ *   │  STEP 3: Make 1200 copies in CFArray                               │
+ *   │  ┌──────────────────────────────────────────────┐                  │
+ *   │  │ [ payload, payload, payload, ... x1200 ]     │                  │
+ *   │  └──────────────────────────────────────────────┘                  │
+ *   │                     │                                               │
+ *   │                     ▼ SERIALIZE TO DISK                             │
+ *   │  STEP 4: Binary plist (survives coreaudiod restart!)               │
+ *   │  ┌──────────────────────────────────────────────┐                  │
+ *   │  │ bplist00... (binary format)                  │                  │
+ *   │  │ → /Library/Preferences/Audio/...plist        │                  │
+ *   │  └──────────────────────────────────────────────┘                  │
+ *   │                     │                                               │
+ *   │                     ▼ ON RESTART: PAYLOAD DEPLOYED!                 │
+ *   │  STEP 5: coreaudiod parses plist → heap full of payload!           │
+ *   │  ┌──────────────────────────────────────────────┐                  │
+ *   │  │ malloc_small zone now contains:              │                  │
+ *   │  │ [ROP][ROP][ROP][ROP][ROP][ROP][ROP][ROP]...  │                  │
+ *   │  └──────────────────────────────────────────────┘                  │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ KEY INSIGHT: Binary in text clothing survives plist parsing. ║ │
+ *   │   ║ The plist parser doesn't validate UTF-16 "string" content!   ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * Now let's dive into the technical details of how this works...
+ *
  * -----------------------------------------------------------------------------
  * 11.1 CFSTRING INTERNALS FOR HEAP SPRAY
  * -----------------------------------------------------------------------------
@@ -9133,6 +9372,127 @@ int main(int argc, char *argv[]) {
  * =============================================================================
  *
  * The ROP chain achieves arbitrary syscall execution.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE STACK PIVOT MAGIC TRICK (Why One Gadget Unlocks Everything)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The vulnerability gives us ONE controlled function call. How do we turn
+ * that into a full ROP chain execution? The stack pivot trick:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │              THE MAGIC TRICK: STACK PIVOT                           │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │  BEFORE: We control ONE pointer dereference                        │
+ *   │  ────────────────────────────────────────────                      │
+ *   │                                                                     │
+ *   │  Real Stack (not ours):     Our Payload (in heap):                 │
+ *   │  ┌──────────────┐           ┌──────────────────┐                   │
+ *   │  │ return addr  │           │ gadget 1         │                   │
+ *   │  │ saved rbp    │           │ gadget 2         │                   │
+ *   │  │ local vars   │           │ gadget 3         │                   │
+ *   │  │ ...          │           │ ...              │                   │
+ *   │  └──────────────┘           │ (1152 bytes)     │                   │
+ *   │        ▲                    └──────────────────┘                   │
+ *   │        │ RSP                       ▲                               │
+ *   │        │                           │ RAX (we control this!)        │
+ *   │  We can call ONE gadget            │                               │
+ *   │  but can't chain more...           │                               │
+ *   │                                                                     │
+ *   │  THE TRICK: xchg rsp, rax ; ret                                    │
+ *   │  ───────────────────────────                                       │
+ *   │                                                                     │
+ *   │  This ONE instruction SWAPS the stack pointer with our pointer!   │
+ *   │                                                                     │
+ *   │  AFTER: The stack IS our payload!                                  │
+ *   │  ────────────────────────────                                      │
+ *   │                                                                     │
+ *   │  Old Stack (abandoned):     Our Payload (NOW THE STACK!):          │
+ *   │  ┌──────────────┐           ┌──────────────────┐                   │
+ *   │  │ return addr  │           │ gadget 1 ◄── RSP │                   │
+ *   │  │ saved rbp    │           │ gadget 2         │                   │
+ *   │  │ local vars   │           │ gadget 3         │                   │
+ *   │  │ ...          │           │ ...              │                   │
+ *   │  └──────────────┘           │ open() syscall   │                   │
+ *   │       (ignored)             │ write() syscall  │                   │
+ *   │                             └──────────────────┘                   │
+ *   │                                    │                               │
+ *   │                                    ▼                               │
+ *   │              Now every RET pops OUR gadgets! Full control!         │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ KEY INSIGHT: We turn "call one function" into "execute our   ║ │
+ *   │   ║ entire ROP chain" with a single xchg instruction.            ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE BOUNCER: PAC (Pointer Authentication Codes)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * But wait - doesn't Apple have pointer authentication to stop this?
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │         POINTER AUTHENTICATION CODES (PAC)                          │
+ *   │              "The Bouncer at Club Function"                         │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │  WHAT IS PAC?                                                       │
+ *   │  ────────────────                                                   │
+ *   │  Apple's ARM64e security: cryptographic signature on pointers.    │
+ *   │  Like a wristband that proves you belong at the club.              │
+ *   │                                                                     │
+ *   │  NORMAL POINTER:        PAC-SIGNED POINTER:                        │
+ *   │  ┌────────────────┐     ┌────────────────────────────────┐         │
+ *   │  │ 0x00007fff1234 │     │ 0x0023_7fff1234               │         │
+ *   │  │ (48-bit addr)  │     │ ^^^^^ PAC signature in top bits│         │
+ *   │  └────────────────┘     └────────────────────────────────┘         │
+ *   │                                                                     │
+ *   │  THE CHECK (autda instruction):                                    │
+ *   │  ┌─────────────────────────────────────────────────────────────┐   │
+ *   │  │  BOUNCER: "Let me see your wristband..."                    │   │
+ *   │  │                                                             │   │
+ *   │  │  ┌──────────────┐     ┌──────────────┐                     │   │
+ *   │  │  │ Valid PAC    │     │ Invalid PAC  │                     │   │
+ *   │  │  │ ✓ Come in!   │     │ ✗ CRASH!     │                     │   │
+ *   │  │  │ Strip PAC,   │     │ Pointer gets │                     │   │
+ *   │  │  │ use pointer  │     │ corrupted    │                     │   │
+ *   │  │  └──────────────┘     └──────────────┘                     │   │
+ *   │  └─────────────────────────────────────────────────────────────┘   │
+ *   │                                                                     │
+ *   │  FROM DISASSEMBLY (vulnerable handler):                            │
+ *   │  ────────────────────────────                                      │
+ *   │    ldr x0, [x23, 0x70]      ; Load pointer                         │
+ *   │    ldr x16, [x0]            ; Dereference                          │
+ *   │    autda x16, x17           ; ◄── PAC CHECK HERE                   │
+ *   │    ldr x8, [x16]            ; Load function ptr                    │
+ *   │    blraaz x8                ; ◄── PAC-checked call                 │
+ *   │                                                                     │
+ *   │  WHY WE STILL WIN:                                                 │
+ *   │  ─────────────────                                                 │
+ *   │  ┌─────────────────────────────────────────────────────────────┐   │
+ *   │  │ PAC is checked on pointers stored in MEMORY.               │   │
+ *   │  │ But RET instruction pops from the STACK.                   │   │
+ *   │  │                                                             │   │
+ *   │  │ After stack pivot:                                          │   │
+ *   │  │   • RSP points to our payload                               │   │
+ *   │  │   • Each RET pops our gadget addresses                      │   │
+ *   │  │   • RET doesn't check PAC - it just pops and jumps!        │   │
+ *   │  │                                                             │   │
+ *   │  │ The bouncer checks wristbands at the DOOR...                │   │
+ *   │  │ ...but we're already INSIDE the club!                      │   │
+ *   │  └─────────────────────────────────────────────────────────────┘   │
+ *   │                                                                     │
+ *   │   ╔═══════════════════════════════════════════════════════════════╗ │
+ *   │   ║ Stack pivot = PAC bypass. Once RSP is ours, RET is ours.     ║ │
+ *   │   ║ This is why stack pivots are so powerful in PAC environments.║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════╝ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * Now let's look at the technical details of building the ROP chain...
  *
  * -----------------------------------------------------------------------------
  * 12.1 GADGET FINDING METHODOLOGY
