@@ -7199,7 +7199,7 @@ For each command, I explain:
 
 ---
 
-## A.1 Apple Security Engineer Perspective: System Configuration
+## A.1  Perspective: System Configuration
 
 ### Experiment 1: Query coreaudiod's launchd configuration
 
@@ -7416,7 +7416,7 @@ This is why sandbox escapes are valuable even when the sandbox is "weak" - `(all
 
 ---
 
-## A.2 Sergei Glazunov Perspective: Reverse Engineering
+## A.2  Perspective: Reverse Engineering
 
 ### Experiment 4: Extract CoreAudio from dyld shared cache
 
@@ -7656,7 +7656,7 @@ FOR EXPLOITATION:
 
 ---
 
-## A.3 Clement Lecigne Perspective: Detection & Forensics
+## A.3  Perspective: Detection & Forensics
 
 ### Experiment 8: Monitor coreaudiod logs in real-time
 
@@ -7762,9 +7762,9 @@ $ sudo fs_usage -w -f filesys | grep -i audio
 
 ---
 
-## A.4 Brandon Falk Perspective: Heap Analysis
+## A.4  Perspective: Heap Analysis
 
-This section is inspired by Brandon Falk's approach: understand the memory allocator at a DEEP level. You can't reliably exploit heap bugs without knowing how the heap actually works.
+This section approach: understand the memory allocator at a DEEP level. You can't reliably exploit heap bugs without knowing how the heap actually works.
 
 ### Experiment 9: Analyze coreaudiod heap allocations
 
@@ -8740,7 +8740,7 @@ Create a kernel extension or DriverKit driver that detects exploitation attempts
 8. [Detection/Blue Team](#8-detectionblue-team)
 9. [Tools](#9-tools)
 10. [Project Zero Research](#10-project-zero-research)
-11. [Brandon Falk / Gamozo Labs](#11-brandon-falk--gamozo-labs)
+11. [ / Gamozo Labs](#11-brandon-falk--gamozo-labs)
 12. [Open Problems / Future Research Directions](#12-open-problems--future-research-directions)
 
 ---
@@ -9127,7 +9127,7 @@ heap -s 1152 <pid>
 
 ---
 
-## 11. Brandon Falk / Gamozo Labs
+## 11.  / Gamozo Labs
 
 ### Blog Posts
 
@@ -9162,7 +9162,7 @@ heap -s 1152 <pid>
 
 ### Social Media
 
-- **Brandon Falk on X/Twitter**: [https://x.com/gamozolabs](https://x.com/gamozolabs)
+- ** on X/Twitter**: [https://x.com/gamozolabs](https://x.com/gamozolabs)
 
 ---
 

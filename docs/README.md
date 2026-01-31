@@ -146,9 +146,9 @@ CoreAudioFuzz/
 
 - **Dillon Franke** (Google Project Zero) - Original vulnerability research
 - **Google Project Zero** - Fuzzing infrastructure and disclosure
-- **Brandon Falk** - Fuzzing methodology inspiration
-- **Sergei Glazunov** - iOS/macOS exploitation techniques
-- **Clement Lecigne** - Detection methodology
+- **** - Fuzzing methodology inspiration
+- **** - iOS/macOS exploitation techniques
+- **** - Detection methodology
 - **Manfred Paul** - Type confusion expertise
 
 ---

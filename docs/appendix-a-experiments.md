@@ -29,7 +29,7 @@ For each command, I explain:
 
 ---
 
-## A.1 Apple Security Engineer Perspective: System Configuration
+## A.1  Perspective: System Configuration
 
 ### Experiment 1: Query coreaudiod's launchd configuration
 
@@ -246,7 +246,7 @@ This is why sandbox escapes are valuable even when the sandbox is "weak" - `(all
 
 ---
 
-## A.2 Sergei Glazunov Perspective: Reverse Engineering
+## A.2  Perspective: Reverse Engineering
 
 ### Experiment 4: Extract CoreAudio from dyld shared cache
 
@@ -486,7 +486,7 @@ FOR EXPLOITATION:
 
 ---
 
-## A.3 Clement Lecigne Perspective: Detection & Forensics
+## A.3  Perspective: Detection & Forensics
 
 ### Experiment 8: Monitor coreaudiod logs in real-time
 
@@ -592,9 +592,9 @@ $ sudo fs_usage -w -f filesys | grep -i audio
 
 ---
 
-## A.4 Brandon Falk Perspective: Heap Analysis
+## A.4  Perspective: Heap Analysis
 
-This section is inspired by Brandon Falk's approach: understand the memory allocator at a DEEP level. You can't reliably exploit heap bugs without knowing how the heap actually works.
+This section approach: understand the memory allocator at a DEEP level. You can't reliably exploit heap bugs without knowing how the heap actually works.
 
 ### Experiment 9: Analyze coreaudiod heap allocations
 

@@ -30,7 +30,7 @@
 8. [Detection/Blue Team](#8-detectionblue-team)
 9. [Tools](#9-tools)
 10. [Project Zero Research](#10-project-zero-research)
-11. [Brandon Falk / Gamozo Labs](#11-brandon-falk--gamozo-labs)
+11. [ / Gamozo Labs](#11-brandon-falk--gamozo-labs)
 12. [Open Problems / Future Research Directions](#12-open-problems--future-research-directions)
 
 ---
@@ -417,7 +417,7 @@ heap -s 1152 <pid>
 
 ---
 
-## 11. Brandon Falk / Gamozo Labs
+## 11.  / Gamozo Labs
 
 ### Blog Posts
 
@@ -452,7 +452,7 @@ heap -s 1152 <pid>
 
 ### Social Media
 
-- **Brandon Falk on X/Twitter**: [https://x.com/gamozolabs](https://x.com/gamozolabs)
+- ** on X/Twitter**: [https://x.com/gamozolabs](https://x.com/gamozolabs)
 
 ---
 
